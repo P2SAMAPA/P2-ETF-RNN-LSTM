@@ -1,0 +1,52 @@
+name: Daily ETF Training Pipeline
+
+on:
+  schedule:
+    # Run at 21:00 UTC = 4:00 PM ET (post US market close, Mon-Fri)
+    - cron: '0 21 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      retrain_from_scratch:
+        description: 'Force retrain from scratch (ignore saved weights)'
+        required: false
+        default: 'false'
+      lookback_years:
+        description: 'Years of data to use for training (default: all)'
+        required: false
+        default: 'all'
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run training pipeline
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          RETRAIN_FROM_SCRATCH: ${{ github.event.inputs.retrain_from_scratch || 'false' }}
+          LOOKBACK_YEARS: ${{ github.event.inputs.lookback_years || 'all' }}
+        run: |
+          python train.py
+
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 30
