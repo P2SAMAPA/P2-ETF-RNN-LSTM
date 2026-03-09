@@ -163,7 +163,83 @@ else:
 
 st.divider()
 
-# ── Live Inference ─────────────────────────────────────────────────────────────
+# ── Live inference function ────────────────────────────────────────────────────
+def _run_live_inference(price_df, ret_df, hurst_threshold, train_split):
+    """Run the full pipeline in-browser with a progress bar."""
+    if price_df is None:
+        st.error("Cannot run inference — price data not loaded.")
+        return
+
+    from data_loader import build_feature_matrix, make_sequences, \
+        train_test_split_sequences, Normaliser
+    from hurst import hurst_exponent, classify_memory
+    from trainer import train_pipeline
+    import torch
+
+    progress = st.progress(0, text="Starting inference…")
+    results  = []
+    device   = torch.device("cpu")   # Streamlit Cloud CPU only
+
+    for i, etf in enumerate(TARGET_ETFS):
+        progress.progress((i / len(TARGET_ETFS)), text=f"Processing {etf}…")
+
+        if etf not in price_df.columns:
+            continue
+
+        data_full = {
+            "price": price_df, "ret": ret_df if ret_df is not None else pd.DataFrame(),
+            "vol": pd.DataFrame(index=price_df.index),
+            "bench_price": pd.DataFrame(index=price_df.index),
+            "bench_ret": pd.DataFrame(index=price_df.index),
+            "bench_vol": pd.DataFrame(index=price_df.index),
+        }
+
+        ret_s = (ret_df[etf].dropna().values
+                 if ret_df is not None and etf in ret_df.columns
+                 else np.diff(np.log(price_df[etf].dropna().values)))
+        H   = hurst_exponent(ret_s)
+        mem = classify_memory(H)
+
+        features = build_feature_matrix(data_full, etf)
+        X, y, dates = make_sequences(features)
+        if len(X) < 50:
+            continue
+
+        X_tr, y_tr, d_tr, X_te, y_te, d_te = \
+            train_test_split_sequences(X, y, dates, train_split)
+        norm = Normaliser()
+        X_tr_n = norm.fit_transform(X_tr)
+        X_te_n = norm.transform(X_te)
+
+        res = train_pipeline(X_tr_n, y_tr, X_te_n, y_te, etf,
+                             mem["use_hybrid"], device)
+
+        current_price = float(price_df[etf].iloc[-1])
+        pred_logret   = float(res["test_preds"][-1]) if len(res["test_preds"]) else 0.0
+        pred_price    = current_price * np.exp(pred_logret)
+        results.append({
+            "etf": etf, "H": H, "model": mem["model"],
+            "pred_ret_pct": pred_logret * 100,
+            "pred_price": pred_price,
+            "current_price": current_price,
+            "dir_acc": res["metrics"].get("hybrid_dir_acc",
+                       res["metrics"].get("rnn_dir_acc", 0)),
+        })
+
+    progress.progress(1.0, text="Done!")
+
+    if results:
+        results.sort(key=lambda x: x["pred_ret_pct"], reverse=True)
+        st.success(f"✅ Inference complete! Top pick: **{results[0]['etf']}**")
+        for r in results:
+            col_a, col_b, col_c, col_d = st.columns(4)
+            col_a.metric(r["etf"], f"{r['pred_ret_pct']:+.3f}%")
+            col_b.metric("Hurst H", f"{r['H']:.3f}")
+            col_c.metric("Model", r["model"])
+            col_d.metric("Dir Acc", f"{r['dir_acc']:.1f}%")
+
+
+# ── Live Inference call ────────────────────────────────────────────────────────
 if run_inference:
     st.subheader("🚀 Live Inference")
     _run_live_inference(price_df, ret_df, hurst_threshold, train_split / 100)
@@ -637,90 +713,3 @@ with tab5:
     guarantee future results. Always consult a qualified financial advisor
     before making investment decisions.
     """)
-
-
-# ── Live inference function ────────────────────────────────────────────────────
-def _run_live_inference(price_df, ret_df, hurst_threshold, train_split):
-    """Run the full pipeline in-browser with a progress bar."""
-    if price_df is None:
-        st.error("Cannot run inference — price data not loaded.")
-        return
-
-    from data_loader import build_feature_matrix, make_sequences, \
-        train_test_split_sequences, Normaliser
-    from hurst import hurst_exponent, classify_memory
-    from trainer import train_pipeline
-    import torch
-
-    progress = st.progress(0, text="Starting inference…")
-    results  = []
-    device   = torch.device("cpu")   # Streamlit Cloud CPU only
-
-    for i, etf in enumerate(TARGET_ETFS):
-        progress.progress((i / len(TARGET_ETFS)), text=f"Processing {etf}…")
-
-        if etf not in price_df.columns:
-            continue
-
-        data = {
-            "price": price_df[[etf]].rename(columns={etf: etf}),
-            "ret":   ret_df[[etf]] if ret_df is not None and etf in ret_df.columns
-                     else pd.DataFrame(index=price_df.index),
-            "vol":   pd.DataFrame(index=price_df.index),
-            "bench_price": pd.DataFrame(index=price_df.index),
-            "bench_ret":   pd.DataFrame(index=price_df.index),
-            "bench_vol":   pd.DataFrame(index=price_df.index),
-        }
-
-        # Simplified data dict for feature builder
-        data_full = {
-            "price": price_df, "ret": ret_df or pd.DataFrame(),
-            "vol": pd.DataFrame(index=price_df.index),
-            "bench_price": pd.DataFrame(index=price_df.index),
-            "bench_ret": pd.DataFrame(index=price_df.index),
-            "bench_vol": pd.DataFrame(index=price_df.index),
-        }
-
-        ret_s = (ret_df[etf].dropna().values
-                 if ret_df is not None and etf in ret_df.columns
-                 else np.diff(np.log(price_df[etf].dropna().values)))
-        H   = hurst_exponent(ret_s)
-        mem = classify_memory(H)
-
-        features = build_feature_matrix(data_full, etf)
-        X, y, dates = make_sequences(features)
-        if len(X) < 50:
-            continue
-
-        X_tr, y_tr, d_tr, X_te, y_te, d_te = \
-            train_test_split_sequences(X, y, dates, train_split)
-        norm = Normaliser()
-        X_tr_n = norm.fit_transform(X_tr)
-        X_te_n = norm.transform(X_te)
-
-        res = train_pipeline(X_tr_n, y_tr, X_te_n, y_te, etf,
-                             mem["use_hybrid"], device)
-
-        current_price = float(price_df[etf].iloc[-1])
-        pred_logret   = float(res["test_preds"][-1]) if len(res["test_preds"]) else 0.0
-        pred_price    = current_price * np.exp(pred_logret)
-        results.append({
-            "etf": etf, "H": H, "model": mem["model"],
-            "pred_ret_pct": pred_logret * 100,
-            "pred_price": pred_price,
-            "current_price": current_price,
-            "dir_acc": res["metrics"].get("hybrid_dir_acc",
-                       res["metrics"].get("rnn_dir_acc", 0)),
-        })
-
-    progress.progress(1.0, text="Done!")
-
-    if results:
-        results.sort(key=lambda x: x["pred_ret_pct"], reverse=True)
-        st.success(f"✅ Inference complete! Top pick: **{results[0]['etf']}**")
-        for r in results:
-            col_a, col_b, col_c, col_d = st.columns(4)
-            col_a.metric(r["etf"], f"{r['pred_ret_pct']:+.3f}%")
-            col_b.metric("Hurst H", f"{r['H']:.3f}")
-            col_c.metric("Model", r["model"])
-            col_d.metric("Dir Acc", f"{r['dir_acc']:.1f}%")
