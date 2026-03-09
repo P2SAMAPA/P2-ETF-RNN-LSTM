@@ -1,7 +1,4 @@
-# app.py
-# Streamlit UI for P2-ETF-RNN-LSTM
-# Live inference + results dashboard
-# UI inspired by the P2-ETF Regime-Aware Rotation Model design
+# app.py  — P2-ETF-RNN-LSTM  (updated UI)
 
 import os
 import warnings
@@ -10,7 +7,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
 from datetime import datetime, timezone
 from huggingface_hub import hf_hub_download
 
@@ -19,7 +15,7 @@ logging.basicConfig(level=logging.WARNING)
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="P2-ETF-RNN-LSTM",
+    page_title="P2-ETF RNN-LSTM",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -29,8 +25,11 @@ st.set_page_config(
 HF_RESULTS  = "P2SAMAPA/p2-etf-rnn-lstm-results"
 HF_SOURCE   = "P2SAMAPA/p2-etf-deepwave-dl"
 TARGET_ETFS = ["TLT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
-BENCH       = ["SPY", "AGG"]
-ETF_LABELS  = {
+TRAIN_SPLIT = 0.80          # fixed 80/20 — paper-aligned, no slider
+AUDIT_ROWS  = 15            # fixed 15 days
+HURST_THRESH = 0.52         # paper optimal threshold
+
+ETF_LABELS = {
     "TLT": "iShares 20yr Treasury",
     "LQD": "iShares Inv Grade Corp",
     "HYG": "iShares High Yield Bond",
@@ -38,43 +37,34 @@ ETF_LABELS  = {
     "GLD": "SPDR Gold Shares",
     "SLV": "iShares Silver Trust",
 }
-ETF_COLORS  = {
-    "TLT": "#00d4ff", "LQD": "#f472b6", "HYG": "#10b981",
-    "VNQ": "#7c3aed", "GLD": "#f59e0b", "SLV": "#94a3b8",
+ETF_COLORS = {
+    "TLT": "#0ea5e9", "LQD": "#ec4899", "HYG": "#10b981",
+    "VNQ": "#8b5cf6", "GLD": "#f59e0b", "SLV": "#94a3b8",
     "SPY": "#6366f1", "AGG": "#84cc16",
 }
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("https://huggingface.co/front/assets/huggingface_logo-noborder.svg", width=40)
+    st.image("https://huggingface.co/front/assets/huggingface_logo-noborder.svg", width=36)
     st.title("P2-ETF RNN-LSTM")
     st.caption("ARMA-RNN-LSTM Hybrid Neural Engine")
-    st.caption(f"🕐 EST: {datetime.now().strftime('%a %b %d, %H:%M')}")
+    st.caption(f"🕐 {datetime.now().strftime('%a %b %d, %H:%M')}")
     st.divider()
 
     st.subheader("⚙️ Configuration")
-    lookback_years = st.slider("Training Lookback (Years)", 2, 16, 8,
-                                help="Years of history used for model training")
-    train_split = st.slider("Train/Test Split (%)", 50, 80, 63,
-                             help="% of data used for training (paper: 62.5%)")
-    st.divider()
 
-    st.subheader("🎯 Model Settings")
-    hurst_threshold = st.slider("Long-Memory Threshold (H)", 0.50, 0.60, 0.52, 0.01,
-                                 help="H above this → ARMA-RNN-LSTM hybrid; else RNN only")
-    show_rnn_baseline = st.checkbox("Show RNN baseline comparison", True)
-    show_combined     = st.checkbox("Show RNN+LSTM (no hybrid) comparison", True)
+    # Training start year slider (2008–2025)
+    start_year = st.slider("Training Data From (Year)", 2008, 2025, 2010,
+                            help="Use data from this year onwards for training")
     st.divider()
 
     st.subheader("📊 Display")
     benchmark = st.selectbox("Benchmark", ["SPY", "AGG", "None"])
-    n_audit_rows = st.slider("Audit Trail Rows", 10, 90, 30)
     st.divider()
 
     force_refresh = st.button("🔄 Force Data Refresh", use_container_width=True)
     run_inference = st.button("🚀 Run Live Inference", use_container_width=True,
                                type="primary")
-
 
 # ── Data loaders ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -84,10 +74,9 @@ def load_results_parquet(filename: str) -> pd.DataFrame | None:
         local = hf_hub_download(repo_id=HF_RESULTS, filename=filename,
                                 repo_type="dataset", token=token or None)
         df = pd.read_parquet(local)
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
-        if "run_date" in df.columns:
-            df["run_date"] = pd.to_datetime(df["run_date"])
+        for col in ["date", "run_date"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col])
         return df
     except Exception:
         return None
@@ -120,197 +109,188 @@ if force_refresh:
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 with st.spinner("Loading latest results from HuggingFace…"):
-    predictions  = load_results_parquet("predictions.parquet")
-    rankings     = load_results_parquet("rankings.parquet")
-    metrics_df   = load_results_parquet("metrics.parquet")
-    audit_df     = load_results_parquet("audit_trail.parquet")
-    price_df     = load_source_parquet("data/etf_price.parquet")
-    ret_df       = load_source_parquet("data/etf_ret.parquet")
-    bench_price  = load_source_parquet("data/bench_price.parquet")
+    predictions = load_results_parquet("predictions.parquet")
+    rankings    = load_results_parquet("rankings.parquet")
+    metrics_df  = load_results_parquet("metrics.parquet")
+    audit_df    = load_results_parquet("audit_trail.parquet")
+    price_df    = load_source_parquet("data/etf_price.parquet")
+    ret_df      = load_source_parquet("data/etf_ret.parquet")
+    bench_ret   = load_source_parquet("data/bench_ret.parquet")
+    bench_price = load_source_parquet("data/bench_price.parquet")
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.markdown("## 📈 P2-ETF RNN-LSTM Neural Forecasting Engine")
-st.caption(
-    "ARMA-RNN-LSTM Hybrid Model · Xiao (2025) PLoS ONE · "
-    "ETFs: " + " · ".join(TARGET_ETFS)
-)
+st.caption("ARMA-RNN-LSTM Hybrid Model · Xiao (2025) PLoS ONE · ETFs: " + " · ".join(TARGET_ETFS))
 
-# ── Data status badges ─────────────────────────────────────────────────────────
-col1, col2, col3, col4 = st.columns(4)
+# ── Status badges ──────────────────────────────────────────────────────────────
+c1, c2, c3, c4 = st.columns(4)
 if price_df is not None:
-    col1.success(
-        f"✅ Dataset: {len(price_df):,} rows × {len(price_df.columns)} cols "
-        f"({price_df.index[0].date()} → {price_df.index[-1].date()})"
-    )
+    c1.success(f"✅ Dataset: {len(price_df):,} rows × {len(price_df.columns)} cols "
+               f"({price_df.index[0].date()} → {price_df.index[-1].date()})")
 else:
-    col1.error("❌ Source data unavailable")
+    c1.error("❌ Source data unavailable")
 
 if predictions is not None:
-    col2.success(f"✅ Predictions loaded ({len(predictions):,} rows)")
+    c2.success(f"✅ Predictions loaded ({len(predictions):,} rows)")
 else:
-    col2.warning("⚠️ No predictions yet — run training pipeline")
+    c2.warning("⚠️ No predictions yet — run training pipeline")
 
 if rankings is not None:
-    latest_date = rankings["date"].max().strftime("%Y-%m-%d")
-    col3.success(f"✅ Rankings available — latest: {latest_date}")
+    c3.success(f"✅ Rankings available — latest: {rankings['date'].max().strftime('%Y-%m-%d')}")
 else:
-    col3.warning("⚠️ No rankings yet")
+    c3.warning("⚠️ No rankings yet")
 
 if metrics_df is not None:
-    col4.success(f"✅ Metrics loaded ({len(metrics_df):,} runs)")
+    c4.success(f"✅ Metrics loaded ({len(metrics_df):,} runs)")
 else:
-    col4.info("ℹ️ No metrics yet")
+    c4.info("ℹ️ No metrics yet")
 
 st.divider()
 
-# ── Live inference function ────────────────────────────────────────────────────
-def _run_live_inference(price_df, ret_df, hurst_threshold, train_split):
-    """Run the full pipeline in-browser with a progress bar."""
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVE INFERENCE FUNCTION  (defined before use)
+# ══════════════════════════════════════════════════════════════════════════════
+def _run_live_inference(price_df, ret_df, start_year):
     if price_df is None:
         st.error("Cannot run inference — price data not loaded.")
         return
-
     from data_loader import build_feature_matrix, make_sequences, \
         train_test_split_sequences, Normaliser
     from hurst import hurst_exponent, classify_memory
     from trainer import train_pipeline
     import torch
 
+    cutoff  = pd.Timestamp(f"{start_year}-01-01")
+    price_f = price_df[price_df.index >= cutoff]
+    ret_f   = ret_df[ret_df.index >= cutoff] if ret_df is not None else None
+
     progress = st.progress(0, text="Starting inference…")
     results  = []
-    device   = torch.device("cpu")   # Streamlit Cloud CPU only
+    device   = torch.device("cpu")
 
     for i, etf in enumerate(TARGET_ETFS):
-        progress.progress((i / len(TARGET_ETFS)), text=f"Processing {etf}…")
-
-        if etf not in price_df.columns:
+        progress.progress(i / len(TARGET_ETFS), text=f"Processing {etf}…")
+        if etf not in price_f.columns:
             continue
-
         data_full = {
-            "price": price_df, "ret": ret_df if ret_df is not None else pd.DataFrame(),
-            "vol": pd.DataFrame(index=price_df.index),
-            "bench_price": pd.DataFrame(index=price_df.index),
-            "bench_ret": pd.DataFrame(index=price_df.index),
-            "bench_vol": pd.DataFrame(index=price_df.index),
+            "price": price_f,
+            "ret":   ret_f if ret_f is not None else pd.DataFrame(),
+            "vol":   pd.DataFrame(index=price_f.index),
+            "bench_price": pd.DataFrame(index=price_f.index),
+            "bench_ret":   pd.DataFrame(index=price_f.index),
+            "bench_vol":   pd.DataFrame(index=price_f.index),
         }
-
-        ret_s = (ret_df[etf].dropna().values
-                 if ret_df is not None and etf in ret_df.columns
-                 else np.diff(np.log(price_df[etf].dropna().values)))
+        ret_s = (ret_f[etf].dropna().values
+                 if ret_f is not None and etf in ret_f.columns
+                 else np.diff(np.log(price_f[etf].dropna().values)))
         H   = hurst_exponent(ret_s)
         mem = classify_memory(H)
-
         features = build_feature_matrix(data_full, etf)
         X, y, dates = make_sequences(features)
         if len(X) < 50:
             continue
-
-        X_tr, y_tr, d_tr, X_te, y_te, d_te = \
-            train_test_split_sequences(X, y, dates, train_split)
+        X_tr, y_tr, _, X_te, y_te, _ = train_test_split_sequences(X, y, dates, TRAIN_SPLIT)
         norm = Normaliser()
-        X_tr_n = norm.fit_transform(X_tr)
-        X_te_n = norm.transform(X_te)
-
-        res = train_pipeline(X_tr_n, y_tr, X_te_n, y_te, etf,
-                             mem["use_hybrid"], device)
-
-        current_price = float(price_df[etf].iloc[-1])
+        res  = train_pipeline(norm.fit_transform(X_tr), y_tr,
+                              norm.transform(X_te),     y_te,
+                              etf, mem["use_hybrid"], device)
+        current_price = float(price_f[etf].iloc[-1])
         pred_logret   = float(res["test_preds"][-1]) if len(res["test_preds"]) else 0.0
-        pred_price    = current_price * np.exp(pred_logret)
         results.append({
             "etf": etf, "H": H, "model": mem["model"],
-            "pred_ret_pct": pred_logret * 100,
-            "pred_price": pred_price,
-            "current_price": current_price,
+            "pred_ret_pct":   pred_logret * 100,
+            "predicted_price": current_price * np.exp(pred_logret),
+            "current_price":  current_price,
             "dir_acc": res["metrics"].get("hybrid_dir_acc",
                        res["metrics"].get("rnn_dir_acc", 0)),
         })
 
     progress.progress(1.0, text="Done!")
-
     if results:
         results.sort(key=lambda x: x["pred_ret_pct"], reverse=True)
         st.success(f"✅ Inference complete! Top pick: **{results[0]['etf']}**")
         for r in results:
-            col_a, col_b, col_c, col_d = st.columns(4)
-            col_a.metric(r["etf"], f"{r['pred_ret_pct']:+.3f}%")
-            col_b.metric("Hurst H", f"{r['H']:.3f}")
-            col_c.metric("Model", r["model"])
-            col_d.metric("Dir Acc", f"{r['dir_acc']:.1f}%")
+            ca, cb, cc, cd = st.columns(4)
+            ca.metric(r["etf"], f"{r['pred_ret_pct']:+.3f}%")
+            cb.metric("Hurst H", f"{r['H']:.3f}")
+            cc.metric("Model", r["model"])
+            cd.metric("Dir Acc", f"{r['dir_acc']:.1f}%")
 
 
 # ── Live Inference call ────────────────────────────────────────────────────────
 if run_inference:
     st.subheader("🚀 Live Inference")
-    _run_live_inference(price_df, ret_df, hurst_threshold, train_split / 100)
+    _run_live_inference(price_df, ret_df, start_year)
 
 # ── Top Signal Banner ──────────────────────────────────────────────────────────
 if rankings is not None and len(rankings) > 0:
-    latest_rankings = rankings[rankings["date"] == rankings["date"].max()].sort_values("rank")
+    latest_rankings = (rankings[rankings["date"] == rankings["date"].max()]
+                       .sort_values("rank"))
 
     if len(latest_rankings) > 0:
         top = latest_rankings.iloc[0]
         ret = top["predicted_return_pct"]
-        signal_color = "#1a4a2e" if ret >= 0 else "#4a1a1a"
-        signal_border = "#10b981" if ret >= 0 else "#ef4444"
+        ret_color  = "#16a34a" if ret >= 0 else "#dc2626"
+        bg_color   = "#f0fdf4" if ret >= 0 else "#fef2f2"
+        bdr_color  = "#bbf7d0" if ret >= 0 else "#fecaca"
 
         st.markdown(f"""
-        <div style="background:{signal_color}; border:1px solid {signal_border};
-                    border-radius:10px; padding:20px 28px; margin-bottom:16px;">
-            <div style="font-size:11px; letter-spacing:3px; color:#94a3b8; margin-bottom:6px;">
+        <div style="background:{bg_color}; border:2px solid {bdr_color};
+                    border-radius:12px; padding:22px 28px; margin-bottom:16px;">
+            <div style="font-size:11px; letter-spacing:3px; color:#6b7280; margin-bottom:8px;">
                 NEXT TRADING DAY SIGNAL — {top['date'].strftime('%A %b %d, %Y')}
-                <span style="float:right; font-size:10px;">MODEL: {top['model_used']}</span>
+                <span style="float:right; font-size:10px; color:#9ca3af;">
+                    MODEL: {top['model_used']}
+                </span>
             </div>
-            <div style="display:flex; align-items:center; gap:32px;">
-                <div>
-                    <div style="font-size:48px; font-weight:900; color:white; line-height:1;">
-                        {top['etf']}
-                    </div>
-                    <div style="font-size:12px; color:#94a3b8; margin-top:4px;">
-                        {ETF_LABELS.get(top['etf'], '')}
-                    </div>
-                    <div style="margin-top:8px; font-size:13px; color:#94a3b8;">
-                        Predicted Return:
-                        <span style="color:{'#10b981' if ret >= 0 else '#ef4444'}; font-weight:700;">
-                            {'+' if ret >= 0 else ''}{ret:.3f}%
-                        </span>
-                        &nbsp;|&nbsp; Dir Accuracy:
-                        <span style="color:#f59e0b; font-weight:700;">
-                            {top['direction_accuracy']:.1f}%
-                        </span>
-                        &nbsp;|&nbsp; H =
-                        <span style="color:#00d4ff; font-weight:700;">{top['hurst_H']:.3f}</span>
-                    </div>
-                </div>
+            <div style="font-size:52px; font-weight:900; color:#111827; line-height:1;">
+                {top['etf']}
+            </div>
+            <div style="font-size:13px; color:#6b7280; margin-top:4px;">
+                {ETF_LABELS.get(top['etf'], '')}
+            </div>
+            <div style="margin-top:10px; font-size:14px; color:#374151;">
+                Predicted Return:
+                <strong style="color:{ret_color};">
+                    {'+' if ret >= 0 else ''}{ret:.3f}%
+                </strong>
+                &nbsp;·&nbsp; Dir Accuracy:
+                <strong style="color:#d97706;">{top['direction_accuracy']:.1f}%</strong>
+                &nbsp;·&nbsp; H =
+                <strong style="color:#0284c7;">{top['hurst_H']:.3f}</strong>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # ── All ETF predictions for latest date ───────────────────────────────
+        # ── All ETF prediction cards (white background) ────────────────────────
         st.subheader("📊 All ETF Predictions — Next Trading Day")
         pred_cols = st.columns(3)
         for i, row in latest_rankings.iterrows():
-            col_idx = int(row["rank"] - 1) % 3
-            etf     = row["etf"]
-            r       = row["predicted_return_pct"]
-            color   = "#10b981" if r > 0 else "#ef4444"
-            with pred_cols[col_idx]:
+            cidx = int(row["rank"] - 1) % 3
+            etf  = row["etf"]
+            r    = row["predicted_return_pct"]
+            ret_col = "#16a34a" if r > 0 else "#dc2626"
+            bg      = "#f0fdf4" if r > 0 else "#fef2f2"
+            bdr     = "#bbf7d0" if r > 0 else "#fecaca"
+            etf_col = ETF_COLORS.get(etf, "#374151")
+            with pred_cols[cidx]:
                 st.markdown(f"""
-                <div style="border:1px solid #1f2d45; border-radius:8px;
-                            padding:14px; margin-bottom:10px; background:#111827;">
-                    <div style="font-size:10px; color:#64748b; margin-bottom:4px;">
+                <div style="border:1px solid {bdr}; border-radius:10px;
+                            padding:16px; margin-bottom:12px; background:{bg};">
+                    <div style="font-size:10px; color:#9ca3af; margin-bottom:4px;">
                         #{int(row['rank'])} · {ETF_LABELS.get(etf, etf)}
                     </div>
-                    <div style="font-size:22px; font-weight:800;
-                                color:{ETF_COLORS.get(etf, '#fff')};">{etf}</div>
-                    <div style="font-size:20px; font-weight:700; color:{color}; margin:4px 0;">
+                    <div style="font-size:26px; font-weight:900;
+                                color:{etf_col};">{etf}</div>
+                    <div style="font-size:22px; font-weight:700;
+                                color:{ret_col}; margin:4px 0;">
                         {'+' if r > 0 else ''}{r:.3f}%
                     </div>
-                    <div style="font-size:11px; color:#64748b;">
-                        H={row['hurst_H']:.3f} · {row['model_used']} · 
-                        Dir Acc {row['direction_accuracy']:.1f}%
+                    <div style="font-size:11px; color:#6b7280;">
+                        H={row['hurst_H']:.3f} · {row['model_used']}
+                        · Dir Acc {row['direction_accuracy']:.1f}%
                     </div>
-                    <div style="font-size:10px; color:#94a3b8; margin-top:4px;">
+                    <div style="font-size:11px; color:#9ca3af; margin-top:4px;">
                         ${row['current_price']:.2f} → ${row['predicted_price']:.2f}
                     </div>
                 </div>
@@ -320,343 +300,413 @@ st.divider()
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 Forecast Charts",
+    "📈 OOS Forecast Chart",
     "📊 Model Performance",
     "🌊 Hurst Analysis",
     "📋 Audit Trail",
     "ℹ️ About the Model",
 ])
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — FORECAST CHARTS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — OOS CUMULATIVE RETURN CHART
+# ══════════════════════════════════════════════════════════════════════════════
 with tab1:
-    st.subheader("Price History & Model Forecasts")
+    st.subheader("OOS Period: Cumulative Return — Model Signal vs Benchmark")
+    st.caption("Cumulative actual return of the model's top-ranked ETF each day vs the selected benchmark. OOS = out-of-sample test period only.")
 
-    etf_sel = st.selectbox("Select ETF", TARGET_ETFS,
-                            format_func=lambda x: f"{x} — {ETF_LABELS[x]}")
+    bench_choice = benchmark if benchmark != "None" else "SPY"
 
-    if price_df is not None and etf_sel in price_df.columns:
-        px_series = price_df[etf_sel].dropna()
-        years_back = lookback_years
-        cutoff = px_series.index[-1] - pd.DateOffset(years=years_back)
-        px_plot = px_series[px_series.index >= cutoff]
+    if audit_df is not None and len(audit_df) > 0 and ret_df is not None:
 
-        # Benchmark overlay
-        bench_series = None
-        if benchmark != "None" and bench_price is not None and benchmark in bench_price.columns:
-            bench_series = bench_price[benchmark].dropna()
-            bench_series = bench_series[bench_series.index >= cutoff]
+        # Build OOS signal series from audit trail
+        # For each date, the top signal ETF is the one with rank=1 in rankings
+        # We then look up the ACTUAL return of that ETF on that date
+        oos = audit_df.copy()
+        oos["date"] = pd.to_datetime(oos["date"])
+        oos = oos.sort_values("date")
 
-        fig = go.Figure()
+        # Get rank-1 signals per date
+        if rankings is not None:
+            rank1 = (rankings[rankings["rank"] == 1][["date", "etf"]]
+                     .rename(columns={"etf": "top_etf"}))
+            rank1["date"] = pd.to_datetime(rank1["date"])
+        else:
+            rank1 = (oos.groupby("date")
+                     .apply(lambda g: g.loc[g["predicted_ret_pct"].idxmax(), "signal_etf"]
+                            if "predicted_ret_pct" in g.columns else g.iloc[0]["signal_etf"])
+                     .reset_index().rename(columns={0: "top_etf"}))
 
-        # ETF price line
-        fig.add_trace(go.Scatter(
-            x=px_plot.index, y=px_plot.values,
-            mode="lines", name=etf_sel,
-            line=dict(color=ETF_COLORS.get(etf_sel, "#00d4ff"), width=2),
-        ))
+        # Merge with actual returns
+        signal_rets = []
+        for _, row in rank1.iterrows():
+            d   = row["date"]
+            etf = row["top_etf"]
+            if etf in ret_df.columns and d in ret_df.index:
+                signal_rets.append({"date": d, "signal_ret": float(ret_df.loc[d, etf])})
+            else:
+                signal_rets.append({"date": d, "signal_ret": np.nan})
 
-        # Benchmark (secondary axis)
-        if bench_series is not None and len(bench_series) > 0:
+        signal_df = pd.DataFrame(signal_rets).dropna().set_index("date").sort_index()
+
+        # Benchmark returns for same dates
+        bench_rets = None
+        if bench_choice != "None" and bench_ret is not None and bench_choice in bench_ret.columns:
+            bench_rets = bench_ret[bench_choice].reindex(signal_df.index).dropna()
+
+        if len(signal_df) >= 2:
+            # Cumulative returns (compound)
+            cum_signal = (1 + signal_df["signal_ret"]).cumprod() - 1
+
+            fig = go.Figure()
             fig.add_trace(go.Scatter(
-                x=bench_series.index, y=bench_series.values,
-                mode="lines", name=benchmark,
-                line=dict(color=ETF_COLORS.get(benchmark, "#6366f1"),
-                          width=1.5, dash="dot"),
-                yaxis="y2",
+                x=cum_signal.index,
+                y=cum_signal.values * 100,
+                mode="lines",
+                name="Model Signal",
+                line=dict(color="#0ea5e9", width=2.5),
             ))
 
-        # Prediction markers from predictions dataset
-        if predictions is not None:
-            etf_preds = predictions[predictions["etf"] == etf_sel].copy()
-            etf_preds = etf_preds[etf_preds["date"] >= cutoff]
-            if len(etf_preds) > 0:
-                colors = ["#10b981" if r > 0 else "#ef4444"
-                          for r in etf_preds["predicted_return_pct"]]
+            if bench_rets is not None and len(bench_rets) >= 2:
+                cum_bench = (1 + bench_rets).cumprod() - 1
                 fig.add_trace(go.Scatter(
-                    x=etf_preds["date"],
-                    y=etf_preds["predicted_price"],
-                    mode="markers",
-                    name="Predicted Price",
-                    marker=dict(color=colors, size=6, symbol="circle"),
+                    x=cum_bench.index,
+                    y=cum_bench.values * 100,
+                    mode="lines",
+                    name=bench_choice,
+                    line=dict(color=ETF_COLORS.get(bench_choice, "#6366f1"),
+                              width=1.8, dash="dot"),
                 ))
 
-        fig.update_layout(
-            height=420,
-            template="plotly_dark",
-            paper_bgcolor="#111827",
-            plot_bgcolor="#0a0e1a",
-            showlegend=True,
-            legend=dict(bgcolor="#111827", bordercolor="#1f2d45"),
-            xaxis=dict(gridcolor="#1f2d45", showgrid=True),
-            yaxis=dict(gridcolor="#1f2d45", showgrid=True, title=f"{etf_sel} Price"),
-            yaxis2=dict(overlaying="y", side="right",
-                        title=benchmark if benchmark != "None" else ""),
-            margin=dict(l=0, r=0, t=30, b=0),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Return distribution
-        if ret_df is not None and etf_sel in ret_df.columns:
-            ret_series = ret_df[etf_sel].dropna()
-            ret_cut    = ret_series[ret_series.index >= cutoff]
-            fig2 = go.Figure()
-            fig2.add_trace(go.Histogram(
-                x=ret_cut.values * 100,
-                nbinsx=80,
-                name="Daily Returns",
-                marker_color=ETF_COLORS.get(etf_sel, "#00d4ff"),
-                opacity=0.75,
-            ))
-            fig2.update_layout(
-                height=220,
+            fig.update_layout(
+                height=440,
                 template="plotly_dark",
-                paper_bgcolor="#111827",
+                paper_bgcolor="#0f172a",
                 plot_bgcolor="#0a0e1a",
-                title=f"{etf_sel} Return Distribution (%)",
-                xaxis_title="Daily Return (%)",
+                title="Cumulative Return — OOS Period (%)",
+                xaxis=dict(gridcolor="#1e293b", title="Date"),
+                yaxis=dict(gridcolor="#1e293b", title="Cumulative Return (%)"),
+                legend=dict(bgcolor="#0f172a", bordercolor="#1e293b"),
                 margin=dict(l=0, r=0, t=40, b=0),
-                showlegend=False,
             )
-            st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.info("Price data not available. Check HuggingFace connection.")
+            fig.add_hline(y=0, line_color="#475569", line_dash="dot")
+            st.plotly_chart(fig, use_container_width=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — MODEL PERFORMANCE
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab2:
-    st.subheader("Model Performance Metrics")
+            # Summary stats under chart
+            total_ret   = float(cum_signal.iloc[-1]) * 100
+            n_days      = len(signal_df)
+            ann_ret     = ((1 + total_ret / 100) ** (252 / n_days) - 1) * 100 if n_days > 0 else 0
+            daily_std   = float(signal_df["signal_ret"].std()) * np.sqrt(252) * 100
+            sharpe      = ann_ret / daily_std if daily_std > 0 else 0
 
-    if metrics_df is not None and len(metrics_df) > 0:
-        latest_metrics = (
-            metrics_df.sort_values("run_date")
-            .groupby("etf").last().reset_index()
-        )
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("Total OOS Return", f"{total_ret:+.2f}%")
+            sc2.metric("Ann. Return (est.)", f"{ann_ret:+.2f}%")
+            sc3.metric("Ann. Volatility", f"{daily_std:.2f}%")
+            sc4.metric("Sharpe (est.)", f"{sharpe:.2f}")
 
-        # Metric cards
-        metric_cols = st.columns(len(TARGET_ETFS))
-        for i, etf in enumerate(TARGET_ETFS):
-            row = latest_metrics[latest_metrics["etf"] == etf]
-            if len(row) == 0:
-                continue
-            row = row.iloc[0]
-            with metric_cols[i]:
-                dir_acc = row.get("hybrid_dir_acc", row.get("rnn_dir_acc", 0))
-                mae     = row.get("hybrid_mae",     row.get("rnn_mae", 0))
-                st.metric(
-                    label=etf,
-                    value=f"{dir_acc:.1f}%",
-                    delta=f"MAE {mae:.5f}",
-                    help=f"Model: {row['model_used']} | H={row['hurst_H']:.3f}",
-                )
-
-        st.divider()
-
-        # Direction accuracy bar chart
-        if show_rnn_baseline:
-            fig = go.Figure()
-            for col, label, color in [
-                ("hybrid_dir_acc",   "ARMA-RNN-LSTM", "#00d4ff"),
-                ("rnn_dir_acc",      "RNN baseline",  "#7c3aed"),
-                ("combined_dir_acc", "RNN+LSTM",      "#f59e0b"),
-            ]:
-                if col in latest_metrics.columns:
-                    fig.add_trace(go.Bar(
-                        x=latest_metrics["etf"],
-                        y=latest_metrics[col],
-                        name=label,
-                        marker_color=color,
-                    ))
         else:
-            fig = go.Figure(go.Bar(
-                x=latest_metrics["etf"],
-                y=latest_metrics.get("hybrid_dir_acc",
-                                      latest_metrics.get("rnn_dir_acc", [])),
-                marker_color=[ETF_COLORS.get(e, "#00d4ff")
-                              for e in latest_metrics["etf"]],
-            ))
+            st.info("Not enough OOS data yet to plot. The chart will populate as daily runs accumulate.")
+            st.caption("Each weekday run adds one new data point — come back after a few weeks of runs.")
 
-        fig.update_layout(
-            height=350,
-            template="plotly_dark",
-            paper_bgcolor="#111827",
-            plot_bgcolor="#0a0e1a",
-            title="Directional Accuracy (%) by ETF & Model",
-            yaxis=dict(range=[40, 80], gridcolor="#1f2d45", title="%"),
-            xaxis=dict(gridcolor="#1f2d45"),
-            barmode="group",
-            margin=dict(l=0, r=0, t=40, b=0),
-            legend=dict(bgcolor="#111827"),
-        )
-        # 50% line
-        fig.add_hline(y=50, line_dash="dot", line_color="#ef4444",
-                      annotation_text="Random (50%)")
-        st.plotly_chart(fig, use_container_width=True)
-
-        # MAE comparison
-        st.subheader("MAE Comparison — Hybrid vs Baselines")
-        mae_cols = [c for c in latest_metrics.columns if "mae" in c.lower()]
-        if mae_cols:
-            fig3 = go.Figure()
-            colors_mae = {"hybrid_mae": "#00d4ff", "rnn_mae": "#7c3aed",
-                          "combined_mae": "#f59e0b"}
-            labels_mae = {"hybrid_mae": "ARMA-RNN-LSTM",
-                          "rnn_mae": "RNN baseline",
-                          "combined_mae": "RNN+LSTM"}
-            for col in mae_cols:
-                if col in latest_metrics.columns:
-                    fig3.add_trace(go.Bar(
-                        x=latest_metrics["etf"],
-                        y=latest_metrics[col],
-                        name=labels_mae.get(col, col),
-                        marker_color=colors_mae.get(col, "#94a3b8"),
-                    ))
-            fig3.update_layout(
-                height=300, template="plotly_dark",
-                paper_bgcolor="#111827", plot_bgcolor="#0a0e1a",
-                barmode="group", margin=dict(l=0, r=0, t=10, b=0),
-                legend=dict(bgcolor="#111827"),
-                yaxis=dict(gridcolor="#1f2d45", title="MAE (log-return)"),
-            )
-            st.plotly_chart(fig3, use_container_width=True)
-
-        # Metrics table
-        st.subheader("Full Metrics Table")
-        display_cols = ["etf", "model_used", "hurst_H", "memory_type",
-                        "hybrid_dir_acc", "hybrid_mae", "hybrid_rmse",
-                        "rnn_dir_acc", "rnn_mae", "train_samples", "test_samples"]
-        show_cols = [c for c in display_cols if c in latest_metrics.columns]
-        st.dataframe(latest_metrics[show_cols], use_container_width=True)
     else:
-        st.info("No metrics available yet. Run the training pipeline first.")
+        st.info("OOS chart will appear once the training pipeline has run and the audit trail is populated.")
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — MODEL PERFORMANCE
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    st.subheader("📊 OOS Model Performance")
+
+    # ── Helper: compute performance stats from audit trail ────────────────────
+    def compute_performance(audit: pd.DataFrame, bench_ret_df: pd.DataFrame,
+                             bench_col: str, rankings_df: pd.DataFrame) -> dict | None:
+        """
+        Compute OOS annualised return, Sharpe, Max DD (P2T), Max DD (daily),
+        Hit Ratio (last 15 days) from the audit trail + actual return data.
+        """
+        if audit is None or rankings_df is None or bench_ret_df is None:
+            return None
+
+        # Get rank-1 signal per date
+        r1 = (rankings_df[rankings_df["rank"] == 1][["date", "etf"]]
+              .rename(columns={"etf": "top_etf"}))
+        r1["date"] = pd.to_datetime(r1["date"])
+
+        # Map to actual returns
+        rows = []
+        for _, row in r1.iterrows():
+            d, etf = row["date"], row["top_etf"]
+            if etf in ret_df.columns and d in ret_df.index:
+                rows.append({"date": d, "ret": float(ret_df.loc[d, etf]), "etf": etf})
+        if not rows:
+            return None
+
+        df = pd.DataFrame(rows).set_index("date").sort_index()
+        df["cum"] = (1 + df["ret"]).cumprod()
+
+        n = len(df)
+        if n < 2:
+            return None
+
+        # Annualised return
+        total_ret = float(df["cum"].iloc[-1]) - 1
+        ann_ret   = ((1 + total_ret) ** (252 / n) - 1) * 100
+
+        # Sharpe
+        ann_vol = df["ret"].std() * np.sqrt(252) * 100
+        sharpe  = ann_ret / ann_vol if ann_vol > 0 else 0
+
+        # Max drawdown — peak to trough
+        roll_max  = df["cum"].cummax()
+        drawdowns = (df["cum"] - roll_max) / roll_max
+        max_dd_pt = float(drawdowns.min()) * 100
+
+        # Max drawdown — single worst day
+        max_dd_day = float(df["ret"].min()) * 100
+
+        # Hit ratio — last 15 days with actual data
+        last15 = df.tail(15)
+        hit_ratio = (last15["ret"] > 0).sum() / len(last15) * 100 if len(last15) > 0 else 0
+
+        # Benchmark stats (same dates)
+        bench_stats = {}
+        if bench_col in bench_ret_df.columns:
+            b = bench_ret_df[bench_col].reindex(df.index).dropna()
+            if len(b) >= 2:
+                b_cum     = (1 + b).cumprod()
+                b_total   = float(b_cum.iloc[-1]) - 1
+                b_ann     = ((1 + b_total) ** (252 / len(b)) - 1) * 100
+                b_vol     = b.std() * np.sqrt(252) * 100
+                b_sharpe  = b_ann / b_vol if b_vol > 0 else 0
+                b_roll    = b_cum.cummax()
+                b_dd      = ((b_cum - b_roll) / b_roll).min() * 100
+                bench_stats = {
+                    "bench_ann_ret": b_ann,
+                    "bench_sharpe":  b_sharpe,
+                    "bench_max_dd":  float(b_dd),
+                }
+
+        return {
+            "ann_ret": ann_ret, "sharpe": sharpe,
+            "max_dd_pt": max_dd_pt, "max_dd_day": max_dd_day,
+            "hit_ratio": hit_ratio, "n_days": n,
+            **bench_stats,
+        }
+
+    bench_col = benchmark if benchmark != "None" else "SPY"
+
+    if (audit_df is not None and rankings is not None
+            and ret_df is not None and bench_ret is not None):
+
+        perf = compute_performance(audit_df, bench_ret, bench_col, rankings)
+
+        if perf:
+            st.caption(f"OOS period: {perf['n_days']} trading days · Benchmark: {bench_col}")
+
+            # ── Top metric row ────────────────────────────────────────────────
+            m1, m2, m3, m4, m5 = st.columns(5)
+
+            bench_ann = perf.get("bench_ann_ret")
+            bench_sh  = perf.get("bench_sharpe")
+            bench_dd  = perf.get("bench_max_dd")
+
+            m1.metric(
+                "Ann. Return (OOS)",
+                f"{perf['ann_ret']:+.2f}%",
+                delta=f"vs {bench_col}: {perf['ann_ret'] - bench_ann:+.2f}%" if bench_ann else None,
+            )
+            m2.metric(
+                "Sharpe Ratio",
+                f"{perf['sharpe']:.2f}",
+                delta=f"vs {bench_col}: {perf['sharpe'] - bench_sh:+.2f}" if bench_sh else None,
+            )
+            m3.metric(
+                "Max DD (Peak→Trough)",
+                f"{perf['max_dd_pt']:.2f}%",
+                delta=f"vs {bench_col}: {perf['max_dd_pt'] - bench_dd:+.2f}%" if bench_dd else None,
+                delta_color="inverse",
+            )
+            m4.metric(
+                "Max DD (Worst Day)",
+                f"{perf['max_dd_day']:.2f}%",
+                delta_color="inverse",
+            )
+            m5.metric(
+                f"Hit Ratio (Last 15d)",
+                f"{perf['hit_ratio']:.1f}%",
+                delta="Above 50% = positive signal" if perf['hit_ratio'] > 50 else "Below 50%",
+                delta_color="normal" if perf['hit_ratio'] > 50 else "inverse",
+            )
+
+            st.divider()
+
+            # ── Benchmark comparison table ─────────────────────────────────────
+            if bench_ann is not None:
+                comp_data = {
+                    "Metric": ["Ann. Return", "Sharpe Ratio", "Max DD (P→T)", "Max DD (Day)", "Hit Ratio (15d)"],
+                    "Model Signal": [
+                        f"{perf['ann_ret']:+.2f}%",
+                        f"{perf['sharpe']:.2f}",
+                        f"{perf['max_dd_pt']:.2f}%",
+                        f"{perf['max_dd_day']:.2f}%",
+                        f"{perf['hit_ratio']:.1f}%",
+                    ],
+                    bench_col: [
+                        f"{bench_ann:+.2f}%",
+                        f"{bench_sh:.2f}",
+                        f"{bench_dd:.2f}%",
+                        "—",
+                        "—",
+                    ],
+                }
+                st.dataframe(pd.DataFrame(comp_data), use_container_width=True, hide_index=True)
+
+        else:
+            st.info("Performance stats will populate once OOS actual returns are available (from T+1 backfill).")
+
+    else:
+        st.info("No performance data yet. Run the training pipeline for at least 2 days to see OOS stats.")
+        st.caption("The pipeline backfills actual returns the following trading day, enabling these calculations.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — HURST ANALYSIS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 with tab3:
-    st.subheader("🌊 Hurst Exponent Analysis")
+    st.subheader("🌊 Hurst Exponent — Model Selection Logic")
     st.markdown("""
-    The **Hurst Exponent (H)** via R/S analysis determines which model to use:
-    - **H > 0.52** → Long-term memory detected → **ARMA-RNN-LSTM Hybrid** (paper §3)
-    - **H ≈ 0.5**  → Near random walk → **Standalone RNN** (paper §4.3)
+    The **Hurst Exponent (H)** via R/S analysis determines which model is used per ETF:
+    - **H > 0.52** → Long-term memory → **ARMA-RNN-LSTM Hybrid** (paper §3)
+    - **H ≈ 0.50** → Near random walk → **Standalone RNN** (paper §4.3)
     - **H < 0.45** → Anti-persistent → **Standalone RNN**
     """)
 
-    if metrics_df is not None:
+    if metrics_df is not None and len(metrics_df) > 0:
         latest = metrics_df.sort_values("run_date").groupby("etf").last().reset_index()
 
         fig_h = go.Figure()
         for _, row in latest.iterrows():
-            color = "#00d4ff" if row["hurst_H"] > hurst_threshold else "#f59e0b"
+            color = "#0ea5e9" if row["hurst_H"] > HURST_THRESH else "#f59e0b"
             fig_h.add_trace(go.Bar(
-                x=[row["etf"]],
-                y=[row["hurst_H"]],
-                name=row["etf"],
-                marker_color=color,
-                text=f"H={row['hurst_H']:.3f}",
-                textposition="outside",
+                x=[row["etf"]], y=[row["hurst_H"]],
+                name=row["etf"], marker_color=color,
+                text=f"H={row['hurst_H']:.3f}", textposition="outside",
             ))
 
-        fig_h.add_hline(y=hurst_threshold, line_dash="dash",
-                        line_color="#ef4444",
-                        annotation_text=f"Long-memory threshold (H={hurst_threshold})",
+        fig_h.add_hline(y=HURST_THRESH, line_dash="dash", line_color="#ef4444",
+                        annotation_text=f"Long-memory threshold (H={HURST_THRESH})",
                         annotation_position="top right")
         fig_h.add_hline(y=0.5, line_dash="dot", line_color="#64748b",
                         annotation_text="Random walk (H=0.5)")
-
         fig_h.update_layout(
             height=380, template="plotly_dark",
-            paper_bgcolor="#111827", plot_bgcolor="#0a0e1a",
+            paper_bgcolor="#0f172a", plot_bgcolor="#0a0e1a",
             title="Hurst Exponent by ETF (latest training run)",
-            yaxis=dict(range=[0.3, 0.9], gridcolor="#1f2d45",
-                       title="Hurst Exponent H"),
-            showlegend=False,
-            margin=dict(l=0, r=0, t=40, b=0),
+            yaxis=dict(range=[0.3, 0.75], gridcolor="#1e293b", title="H"),
+            showlegend=False, margin=dict(l=0, r=0, t=40, b=0),
         )
         st.plotly_chart(fig_h, use_container_width=True)
 
-        # Table
-        hurst_table = latest[["etf", "hurst_H", "memory_type", "model_used"]].copy()
-        hurst_table.columns = ["ETF", "Hurst H", "Memory Type", "Model Used"]
-        st.dataframe(hurst_table, use_container_width=True, hide_index=True)
-
+        hurst_tbl = latest[["etf", "hurst_H", "memory_type", "model_used"]].copy()
+        hurst_tbl.columns = ["ETF", "Hurst H", "Memory Type", "Model Used"]
+        st.dataframe(hurst_tbl, use_container_width=True, hide_index=True)
     else:
-        # Show theoretical explanation if no data yet
         st.info("Hurst analysis will appear after the first training run.")
-        st.markdown("""
-        **Expected results based on literature:**
-        | ETF | Asset Class | Expected H | Notes |
-        |-----|-------------|------------|-------|
-        | GLD | Gold | ~0.60–0.65 | Strong trend persistence |
-        | TLT | Long Treasury | ~0.58–0.62 | Rate cycle persistence |
-        | VNQ | Real Estate | ~0.55–0.60 | Property cycle memory |
-        | HYG | High Yield | ~0.52–0.58 | Credit cycle |
-        | LQD | IG Corp Bond | ~0.50–0.55 | Near random |
-        | SLV | Silver | ~0.50–0.55 | More volatile |
-        """)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — AUDIT TRAIL
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — AUDIT TRAIL  (fixed 15 days, all 6 ETFs per day, actual returns)
+# ══════════════════════════════════════════════════════════════════════════════
 with tab4:
-    st.subheader(f"📋 Audit Trail — Last {n_audit_rows} Trading Days")
+    st.subheader("📋 Audit Trail — Last 15 Trading Days")
+    st.caption("Today's actual return = N/A (backfilled next trading day by train.py). All 6 ETFs shown per day.")
 
-    if audit_df is not None and len(audit_df) > 0:
-        audit_show = (
-            audit_df.sort_values("date", ascending=False)
-            .head(n_audit_rows)
-            .copy()
-        )
-        audit_show["date"] = audit_show["date"].dt.strftime("%Y-%m-%d")
+    if audit_df is not None and len(audit_df) > 0 and ret_df is not None:
 
-        # Format return columns
-        for col in ["predicted_ret_pct", "actual_ret_pct"]:
-            if col in audit_show.columns:
-                audit_show[col] = audit_show[col].apply(
-                    lambda x: f"{x:+.3f}%" if pd.notna(x) else "—"
-                )
+        audit_work = audit_df.copy()
+        audit_work["date"] = pd.to_datetime(audit_work["date"])
 
-        # Highlight top pick column
-        st.dataframe(
-            audit_show,
-            use_container_width=True,
-            column_config={
-                "date":              st.column_config.TextColumn("Date"),
-                "signal_etf":        st.column_config.TextColumn("Signal ETF"),
-                "predicted_ret_pct": st.column_config.TextColumn("Predicted Ret%"),
-                "actual_ret_pct":    st.column_config.TextColumn("Actual Ret%"),
-                "hurst_H":           st.column_config.NumberColumn("Hurst H", format="%.3f"),
-                "model_used":        st.column_config.TextColumn("Model"),
-                "direction_accuracy":st.column_config.NumberColumn("Dir Acc%", format="%.1f"),
-            },
-        )
+        # Get the 15 most recent distinct dates
+        recent_dates = sorted(audit_work["date"].unique(), reverse=True)[:AUDIT_ROWS]
+        audit_work   = audit_work[audit_work["date"].isin(recent_dates)].copy()
 
-        # Win rate summary
-        if "actual_ret_pct" in audit_df.columns:
-            filled = audit_df[audit_df["actual_ret_pct"].notna()].copy()
-            if len(filled) > 0:
-                filled["actual_ret_pct"] = pd.to_numeric(
-                    filled["actual_ret_pct"].astype(str).str.replace("%",""),
-                    errors="coerce"
-                )
-                wins    = (filled["actual_ret_pct"] > 0).sum()
-                total   = len(filled)
-                win_pct = wins / total * 100
+        # For each row, look up the actual ETF return from ret_df
+        def get_actual_ret(row):
+            d   = row["date"]
+            etf = row["signal_etf"]
+            today = pd.Timestamp(datetime.now().date())
+            # If date is today → N/A (not yet known)
+            if d >= today:
+                return None
+            if etf in ret_df.columns and d in ret_df.index:
+                return round(float(ret_df.loc[d, etf]) * 100, 4)
+            return None
 
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Win Rate", f"{win_pct:.1f}%")
-                c2.metric("Total Signals", total)
-                c3.metric("Wins", wins)
-                avg_ret = filled["actual_ret_pct"].mean()
-                c4.metric("Avg Actual Return", f"{avg_ret:+.3f}%")
+        audit_work["actual_ret_pct"] = audit_work.apply(get_actual_ret, axis=1)
+
+        # Identify top pick per date (rank 1)
+        top_picks = {}
+        if rankings is not None:
+            r1 = rankings[rankings["rank"] == 1][["date", "etf"]]
+            r1["date"] = pd.to_datetime(r1["date"])
+            top_picks = dict(zip(r1["date"], r1["etf"]))
+
+        # Build display table
+        display_rows = []
+        for _, row in audit_work.sort_values(["date", "signal_etf"],
+                                               ascending=[False, True]).iterrows():
+            is_top = top_picks.get(row["date"]) == row["signal_etf"]
+            actual = row["actual_ret_pct"]
+            display_rows.append({
+                "Date":           row["date"].strftime("%Y-%m-%d"),
+                "ETF":            ("⭐ " if is_top else "") + row["signal_etf"],
+                "Predicted Ret%": f"{row['predicted_ret_pct']:+.3f}%"
+                                  if pd.notna(row.get("predicted_ret_pct")) else "—",
+                "Actual Ret%":    f"{actual:+.3f}%" if actual is not None else "N/A",
+                "Result":         ("✅" if actual is not None and actual > 0
+                                   else ("❌" if actual is not None and actual <= 0
+                                         else "⏳")),
+                "Hurst H":        round(row["hurst_H"], 3) if pd.notna(row.get("hurst_H")) else "—",
+                "Model":          row.get("model_used", "—"),
+                "Dir Acc%":       round(row.get("direction_accuracy", 0), 1),
+            })
+
+        display_df = pd.DataFrame(display_rows)
+        st.dataframe(display_df, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Date":           st.column_config.TextColumn("Date", width="small"),
+                         "ETF":            st.column_config.TextColumn("ETF", width="small"),
+                         "Predicted Ret%": st.column_config.TextColumn("Pred Ret%"),
+                         "Actual Ret%":    st.column_config.TextColumn("Actual Ret%"),
+                         "Result":         st.column_config.TextColumn("✓/✗", width="small"),
+                         "Hurst H":        st.column_config.NumberColumn("H", format="%.3f"),
+                         "Model":          st.column_config.TextColumn("Model"),
+                         "Dir Acc%":       st.column_config.NumberColumn("Dir Acc%", format="%.1f"),
+                     })
+
+        # Win rate for ⭐ top pick rows only (where actual is known)
+        top_rows = [r for r in display_rows
+                    if r["ETF"].startswith("⭐") and r["Actual Ret%"] not in ("N/A", "—")]
+        if top_rows:
+            wins  = sum(1 for r in top_rows if float(r["Actual Ret%"].replace("%","")) > 0)
+            total = len(top_rows)
+            avg   = np.mean([float(r["Actual Ret%"].replace("%","")) for r in top_rows])
+            st.divider()
+            st.caption("⭐ Top Pick performance summary")
+            wc1, wc2, wc3 = st.columns(3)
+            wc1.metric("Hit Ratio (Top Pick)", f"{wins/total*100:.1f}%")
+            wc2.metric("Signals Evaluated", total)
+            wc3.metric("Avg Actual Return", f"{avg:+.3f}%")
+
     else:
         st.info("Audit trail will populate after the first training run.")
+        st.caption("Actual returns are backfilled the following trading day — N/A for the most recent date is expected.")
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — ABOUT
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 with tab5:
     st.subheader("ℹ️ About the ARMA-RNN-LSTM Model")
     st.markdown("""
@@ -668,48 +718,38 @@ with tab5:
     ---
 
     ### 🔬 Core Insight
-    Standard LSTM networks are supposed to separate long-term from short-term memory
-    internally via their gating mechanism. However, the paper demonstrates that **LSTMs
-    often misclassify short-term memory as long-term**, reducing forecast accuracy.
-
-    The solution: **pre-separate the two memory types externally** before feeding into LSTM.
+    Standard LSTMs are supposed to separate long-term from short-term memory internally.
+    The paper shows they often **misclassify short-term memory as long-term**, reducing accuracy.
+    The fix: **pre-separate the two memory types externally** before feeding into LSTM.
 
     ---
 
     ### 🏗️ 3-Stage Pipeline
 
-    | Stage | Model | Role | Equation |
-    |-------|-------|------|----------|
-    | **1** | SimpleRNN | Captures **short-term memory** (by design, RNNs can't do long-term) | Eq. 24–27 |
-    | **2** | ResidualLSTM | Trained on RNN residuals → extracts **long-term memory** | Eq. 28–29 |
-    | **3** | HybridLSTM | Fuses both outputs → final refined forecast | Eq. 30–33 |
+    | Stage | Model | Role |
+    |-------|-------|------|
+    | **1** | SimpleRNN | Captures **short-term memory** (RNNs structurally cannot do long-term) |
+    | **2** | ResidualLSTM | Trained on RNN residuals → extracts **long-term memory** |
+    | **3** | HybridLSTM | Fuses both → final refined forecast |
 
     ---
 
-    ### 🌊 Hurst Exponent Decision Rule
-    Before training, the **R/S analysis** (Hurst exponent) determines which model to use:
-    - **H > 0.52** → Series has long-term memory → **Use full ARMA-RNN-LSTM hybrid**
-    - **H ≈ 0.5**  → Random walk, no long-term memory → **Use RNN only** (hybrid adds noise)
-
-    > *"For the SSE which lacks long-term memory, the RNN model achieves highest
-    > forecasting accuracy"* — Xiao (2025) §4.3
+    ### 🌊 Hurst Decision Rule
+    - **H > 0.52** → Use ARMA-RNN-LSTM hybrid
+    - **H ≈ 0.50** → Use RNN only (hybrid adds noise on random-walk series)
 
     ---
 
-    ### 📊 Data Sources
-    | File | Contents |
-    |------|----------|
-    | `etf_price.parquet` | Daily closing prices (TLT, LQD, HYG, VNQ, GLD, SLV) |
-    | `etf_ret.parquet` | Daily log-returns |
-    | `etf_vol.parquet` | Daily volume |
-    | `bench_price.parquet` | SPY + AGG benchmark prices |
-    | `bench_ret.parquet` | SPY + AGG returns |
+    ### ⚙️ Fixed Parameters (paper-optimal)
+    | Parameter | Value | Rationale |
+    |-----------|-------|-----------|
+    | Train/Test split | **80/20** | Maximise training data |
+    | Hurst threshold | **0.52** | Paper §4.3 optimal |
+    | Lookback window | **10 days** | Paper setting |
 
     ---
 
     ### ⚠️ Disclaimer
-    This application is for **educational and research purposes only**.
-    It does not constitute financial advice. Past model performance does not
-    guarantee future results. Always consult a qualified financial advisor
-    before making investment decisions.
+    Educational and research purposes only. Not financial advice.
+    Past model performance does not guarantee future results.
     """)
