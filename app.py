@@ -208,93 +208,120 @@ def _run_live_inference(price_df, ret_df, start_year):
     progress.progress(1.0, text="Done!")
     if results:
         results.sort(key=lambda x: x["pred_ret_pct"], reverse=True)
-        st.success(f"✅ Inference complete! Top pick: **{results[0]['etf']}**")
-        for r in results:
-            ca, cb, cc, cd = st.columns(4)
-            ca.metric(r["etf"], f"{r['pred_ret_pct']:+.3f}%")
-            cb.metric("Hurst H", f"{r['H']:.3f}")
-            cc.metric("Model", r["model"])
-            cd.metric("Dir Acc", f"{r['dir_acc']:.1f}%")
+        # Store in session state — hero banner will use these instead of HF rankings
+        st.session_state["live_results"] = results
+        st.session_state["live_ran"]     = True
+        st.success(f"✅ Live inference complete — signals updated below ↓")
 
 
 # ── Live Inference call ────────────────────────────────────────────────────────
 if run_inference:
-    st.subheader("🚀 Live Inference")
     _run_live_inference(price_df, ret_df, start_year)
 
+# ── Determine signal source ───────────────────────────────────────────────────
+# Live inference overrides HF rankings to avoid showing two conflicting signals.
+live_ran     = st.session_state.get("live_ran", False)
+live_results = st.session_state.get("live_results", [])
+
+if live_ran and live_results:
+    signal_source   = "🚀 Live Inference (in-browser)"
+    signal_date_str = datetime.now().strftime("%A %b %d, %Y")
+    latest_rankings = pd.DataFrame([
+        {
+            "rank":                 i + 1,
+            "etf":                  r["etf"],
+            "predicted_return_pct": r["pred_ret_pct"],
+            "predicted_price":      r["predicted_price"],
+            "current_price":        r["current_price"],
+            "model_used":           r["model"],
+            "hurst_H":              r["H"],
+            "direction_accuracy":   r["dir_acc"],
+            "date":                 pd.Timestamp(datetime.now().date()),
+        }
+        for i, r in enumerate(live_results)
+    ])
+elif rankings is not None and len(rankings) > 0:
+    signal_source   = "📡 Last Scheduled Run (GitHub Actions)"
+    latest_rankings = rankings[rankings["date"] == rankings["date"].max()].sort_values("rank")
+    signal_date_str = latest_rankings.iloc[0]["date"].strftime("%A %b %d, %Y") \
+                      if len(latest_rankings) > 0 else ""
+else:
+    latest_rankings = pd.DataFrame()
+    signal_source   = ""
+    signal_date_str = ""
+
 # ── Top Signal Banner ──────────────────────────────────────────────────────────
-if rankings is not None and len(rankings) > 0:
-    latest_rankings = (rankings[rankings["date"] == rankings["date"].max()]
-                       .sort_values("rank"))
+if len(latest_rankings) > 0:
+    top = latest_rankings.iloc[0]
+    ret = top["predicted_return_pct"]
+    ret_color = "#16a34a" if ret >= 0 else "#dc2626"
+    bg_color  = "#f0fdf4" if ret >= 0 else "#fef2f2"
+    bdr_color = "#bbf7d0" if ret >= 0 else "#fecaca"
 
-    if len(latest_rankings) > 0:
-        top = latest_rankings.iloc[0]
-        ret = top["predicted_return_pct"]
-        ret_color  = "#16a34a" if ret >= 0 else "#dc2626"
-        bg_color   = "#f0fdf4" if ret >= 0 else "#fef2f2"
-        bdr_color  = "#bbf7d0" if ret >= 0 else "#fecaca"
+    # Show which source these signals come from — avoids confusion
+    st.caption(f"Signal source: {signal_source}")
 
-        st.markdown(f"""
-        <div style="background:{bg_color}; border:2px solid {bdr_color};
-                    border-radius:12px; padding:22px 28px; margin-bottom:16px;">
-            <div style="font-size:11px; letter-spacing:3px; color:#6b7280; margin-bottom:8px;">
-                NEXT TRADING DAY SIGNAL — {top['date'].strftime('%A %b %d, %Y')}
-                <span style="float:right; font-size:10px; color:#9ca3af;">
-                    MODEL: {top['model_used']}
-                </span>
-            </div>
-            <div style="font-size:52px; font-weight:900; color:#111827; line-height:1;">
-                {top['etf']}
-            </div>
-            <div style="font-size:13px; color:#6b7280; margin-top:4px;">
-                {ETF_LABELS.get(top['etf'], '')}
-            </div>
-            <div style="margin-top:10px; font-size:14px; color:#374151;">
-                Predicted Return:
-                <strong style="color:{ret_color};">
-                    {'+' if ret >= 0 else ''}{ret:.3f}%
-                </strong>
-                &nbsp;·&nbsp; Dir Accuracy:
-                <strong style="color:#d97706;">{top['direction_accuracy']:.1f}%</strong>
-                &nbsp;·&nbsp; H =
-                <strong style="color:#0284c7;">{top['hurst_H']:.3f}</strong>
-            </div>
+    st.markdown(f"""
+    <div style="background:{bg_color}; border:2px solid {bdr_color};
+                border-radius:12px; padding:22px 28px; margin-bottom:16px;">
+        <div style="font-size:11px; letter-spacing:3px; color:#6b7280; margin-bottom:8px;">
+            NEXT TRADING DAY SIGNAL — {signal_date_str}
+            <span style="float:right; font-size:10px; color:#9ca3af;">
+                MODEL: {top['model_used']}
+            </span>
         </div>
-        """, unsafe_allow_html=True)
+        <div style="font-size:52px; font-weight:900; color:#111827; line-height:1;">
+            {top['etf']}
+        </div>
+        <div style="font-size:13px; color:#6b7280; margin-top:4px;">
+            {ETF_LABELS.get(top['etf'], '')}
+        </div>
+        <div style="margin-top:10px; font-size:14px; color:#374151;">
+            Predicted Return:
+            <strong style="color:{ret_color};">
+                {'+' if ret >= 0 else ''}{ret:.3f}%
+            </strong>
+            &nbsp;·&nbsp; Dir Accuracy:
+            <strong style="color:#d97706;">{top['direction_accuracy']:.1f}%</strong>
+            &nbsp;·&nbsp; H =
+            <strong style="color:#0284c7;">{top['hurst_H']:.3f}</strong>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-        # ── All ETF prediction cards (white background) ────────────────────────
-        st.subheader("📊 All ETF Predictions — Next Trading Day")
-        pred_cols = st.columns(3)
-        for i, row in latest_rankings.iterrows():
-            cidx = int(row["rank"] - 1) % 3
-            etf  = row["etf"]
-            r    = row["predicted_return_pct"]
-            ret_col = "#16a34a" if r > 0 else "#dc2626"
-            bg      = "#f0fdf4" if r > 0 else "#fef2f2"
-            bdr     = "#bbf7d0" if r > 0 else "#fecaca"
-            etf_col = ETF_COLORS.get(etf, "#374151")
-            with pred_cols[cidx]:
-                st.markdown(f"""
-                <div style="border:1px solid {bdr}; border-radius:10px;
-                            padding:16px; margin-bottom:12px; background:{bg};">
-                    <div style="font-size:10px; color:#9ca3af; margin-bottom:4px;">
-                        #{int(row['rank'])} · {ETF_LABELS.get(etf, etf)}
-                    </div>
-                    <div style="font-size:26px; font-weight:900;
-                                color:{etf_col};">{etf}</div>
-                    <div style="font-size:22px; font-weight:700;
-                                color:{ret_col}; margin:4px 0;">
-                        {'+' if r > 0 else ''}{r:.3f}%
-                    </div>
-                    <div style="font-size:11px; color:#6b7280;">
-                        H={row['hurst_H']:.3f} · {row['model_used']}
-                        · Dir Acc {row['direction_accuracy']:.1f}%
-                    </div>
-                    <div style="font-size:11px; color:#9ca3af; margin-top:4px;">
-                        ${row['current_price']:.2f} → ${row['predicted_price']:.2f}
-                    </div>
+    # ── All ETF prediction cards ───────────────────────────────────────────
+    st.subheader("📊 All ETF Predictions — Next Trading Day")
+    pred_cols = st.columns(3)
+    for i, row in latest_rankings.iterrows():
+        cidx = int(row["rank"] - 1) % 3
+        etf  = row["etf"]
+        r    = row["predicted_return_pct"]
+        ret_col = "#16a34a" if r > 0 else "#dc2626"
+        bg      = "#f0fdf4" if r > 0 else "#fef2f2"
+        bdr     = "#bbf7d0" if r > 0 else "#fecaca"
+        etf_col = ETF_COLORS.get(etf, "#374151")
+        with pred_cols[cidx]:
+            st.markdown(f"""
+            <div style="border:1px solid {bdr}; border-radius:10px;
+                        padding:16px; margin-bottom:12px; background:{bg};">
+                <div style="font-size:10px; color:#9ca3af; margin-bottom:4px;">
+                    #{int(row['rank'])} · {ETF_LABELS.get(etf, etf)}
                 </div>
-                """, unsafe_allow_html=True)
+                <div style="font-size:26px; font-weight:900;
+                            color:{etf_col};">{etf}</div>
+                <div style="font-size:22px; font-weight:700;
+                            color:{ret_col}; margin:4px 0;">
+                    {'+' if r > 0 else ''}{r:.3f}%
+                </div>
+                <div style="font-size:11px; color:#6b7280;">
+                    H={row['hurst_H']:.3f} · {row['model_used']}
+                    · Dir Acc {row['direction_accuracy']:.1f}%
+                </div>
+                <div style="font-size:11px; color:#9ca3af; margin-top:4px;">
+                    ${row['current_price']:.2f} → ${row['predicted_price']:.2f}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 st.divider()
 
