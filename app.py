@@ -22,11 +22,11 @@ st.set_page_config(
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-HF_RESULTS  = "P2SAMAPA/p2-etf-rnn-lstm-results"
-HF_SOURCE   = "P2SAMAPA/p2-etf-deepwave-dl"
-TARGET_ETFS = ["TLT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
-TRAIN_SPLIT = 0.80
-AUDIT_ROWS  = 15
+HF_RESULTS   = "P2SAMAPA/p2-etf-rnn-lstm-results"
+HF_SOURCE    = "P2SAMAPA/p2-etf-deepwave-dl"
+TARGET_ETFS  = ["TLT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
+TRAIN_SPLIT  = 0.80
+AUDIT_ROWS   = 15
 HURST_THRESH = 0.52
 
 ETF_LABELS = {
@@ -42,7 +42,19 @@ ETF_COLORS = {
     "VNQ": "#8b5cf6", "GLD": "#f59e0b", "SLV": "#94a3b8",
     "SPY": "#6366f1", "AGG": "#84cc16",
 }
-CONVICTION_WEIGHTS = {"votes": 0.40, "return": 0.35, "hurst": 0.25}
+
+# Conviction weights (v2) — dir_acc replaces raw predicted return
+CONVICTION_W = {"votes": 0.35, "dir_acc": 0.40, "hurst": 0.25}
+
+# ── Shared Plotly layout helper ────────────────────────────────────────────────
+# White background for all charts
+CHART_LAYOUT = dict(
+    template="plotly_white",
+    paper_bgcolor="#ffffff",
+    plot_bgcolor="#f8fafc",
+    font=dict(color="#1e293b"),
+)
+
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -106,10 +118,16 @@ def load_source_parquet(filename: str) -> pd.DataFrame | None:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_consensus_from_hf() -> tuple:
-    """Load cached consensus results from HF (fast, no re-training)."""
     try:
-        from consensus import load_consensus_results
-        return load_consensus_results()
+        token = os.environ.get("HF_TOKEN", "")
+        def _load(fname):
+            local = hf_hub_download(
+                repo_id=HF_RESULTS, filename=fname,
+                repo_type="dataset", token=token or None)
+            return pd.read_parquet(local)
+        conviction = _load("consensus/consensus_latest.parquet")
+        flat       = _load("consensus/flat_latest.parquet")
+        return conviction, flat
     except Exception:
         return None, None
 
@@ -122,6 +140,10 @@ def clear_cache():
 
 if force_refresh:
     clear_cache()
+    st.rerun()
+
+if refresh_consensus:
+    load_consensus_from_hf.clear()
     st.rerun()
 
 # ── Load data ──────────────────────────────────────────────────────────────────
@@ -215,9 +237,9 @@ def _run_live_inference(price_df, ret_df, start_year):
         pred_logret   = float(res["test_preds"][-1]) if len(res["test_preds"]) else 0.0
         results.append({
             "etf": etf, "H": H, "model": mem["model"],
-            "pred_ret_pct":   pred_logret * 100,
+            "pred_ret_pct":    pred_logret * 100,
             "predicted_price": current_price * np.exp(pred_logret),
-            "current_price":  current_price,
+            "current_price":   current_price,
             "dir_acc": res["metrics"].get("hybrid_dir_acc",
                        res["metrics"].get("rnn_dir_acc", 0)),
         })
@@ -326,10 +348,8 @@ if len(latest_rankings) > 0:
                 <div style="font-size:10px; color:#9ca3af; margin-bottom:4px;">
                     #{int(row['rank'])} · {ETF_LABELS.get(etf, etf)}
                 </div>
-                <div style="font-size:26px; font-weight:900;
-                            color:{etf_col};">{etf}</div>
-                <div style="font-size:22px; font-weight:700;
-                            color:{ret_col}; margin:4px 0;">
+                <div style="font-size:26px; font-weight:900; color:{etf_col};">{etf}</div>
+                <div style="font-size:22px; font-weight:700; color:{ret_col}; margin:4px 0;">
                     {'+' if r > 0 else ''}{r:.3f}%
                 </div>
                 <div style="font-size:11px; color:#6b7280;">
@@ -343,11 +363,6 @@ if len(latest_rankings) > 0:
             """, unsafe_allow_html=True)
 
 st.divider()
-
-# ── Consensus refresh ─────────────────────────────────────────────────────────
-if refresh_consensus:
-    load_consensus_from_hf.clear()
-    st.rerun()
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 tab1, tab_consensus, tab2, tab3, tab4, tab5 = st.tabs([
@@ -366,23 +381,25 @@ with tab_consensus:
     st.subheader("🔁 Consensus Sweep — All Training Windows (2008–2024)")
     st.caption(
         "Each year from 2008 to 2024 is used as a training-start cutoff. "
-        "All 17 windows run in parallel and their signals are combined via "
-        "a weighted conviction score: "
-        f"{int(CONVICTION_WEIGHTS['votes']*100)}% vote share · "
-        f"{int(CONVICTION_WEIGHTS['return']*100)}% avg predicted return · "
-        f"{int(CONVICTION_WEIGHTS['hurst']*100)}% avg Hurst H."
+        "All 17 windows run in parallel via GitHub Actions and their signals are "
+        "combined using a weighted conviction score: "
+        f"{int(CONVICTION_W['votes']*100)}% vote share · "
+        f"{int(CONVICTION_W['dir_acc']*100)}% OOS directional accuracy · "
+        f"{int(CONVICTION_W['hurst']*100)}% avg Hurst H."
     )
 
-    # ── Load from HF cache ────────────────────────────────────────────────────
     conviction_df, flat_df = load_consensus_from_hf()
 
     if conviction_df is not None and len(conviction_df) > 0:
-        run_ts       = conviction_df["run_ts"].iloc[0] if "run_ts" in conviction_df.columns else "unknown"
-        years_run    = int(conviction_df["years_run"].iloc[0]) if "years_run" in conviction_df.columns else "?"
-        year_tops    = {}
+        run_ts    = conviction_df["run_ts"].iloc[0] if "run_ts" in conviction_df.columns else "unknown"
+        years_run = int(conviction_df["years_run"].iloc[0]) if "years_run" in conviction_df.columns else "?"
+        year_tops = {}
         if flat_df is not None and "year" in flat_df.columns and "pred_ret_pct" in flat_df.columns:
-            year_tops = (flat_df.sort_values("pred_ret_pct", ascending=False)
-                                .groupby("year").first()["etf"].to_dict())
+            year_tops = (
+                flat_df.sort_values("pred_ret_pct", ascending=False)
+                       .groupby("year").first()["etf"]
+                       .to_dict()
+            )
         data_source = f"📡 GitHub Actions run — {run_ts[:10] if run_ts != 'unknown' else '—'} UTC"
     else:
         conviction_df = None
@@ -404,28 +421,27 @@ with tab_consensus:
         1. Trains the ARMA-RNN-LSTM pipeline for each start year (2008 → 2024) in parallel threads
         2. Each window produces a top-ranked ETF for the next trading day
         3. Signals are combined using a weighted conviction formula:
-           - **40%** — vote share (how many windows agree on this ETF)
-           - **35%** — average predicted return across windows
-           - **25%** — average Hurst H (trend-persistence signal strength)
-        4. Results are saved to HuggingFace with a date-stamp and cleaned up automatically
+           - **35%** — vote share (how many windows agree on this ETF as #1)
+           - **40%** — avg OOS directional accuracy (predicted vs actual direction sync)
+           - **25%** — avg Hurst H (trend-persistence signal strength)
+        4. Results are saved to HuggingFace with a date stamp and cleaned up automatically
         """)
     else:
-        # ── Run metadata ──────────────────────────────────────────────────────
-        st.caption(f"Source: {data_source} · {years_run} windows ran · "
-                   f"Date: {run_ts[:10] if run_ts else '—'}")
+        st.caption(f"Source: {data_source} · {years_run} windows ran · Date: {run_ts[:10] if run_ts else '—'}")
 
-        top_row = conviction_df.iloc[0]
-        top_etf = top_row["etf"]
-        conv    = float(top_row["conviction"])
-        avg_ret = float(top_row["avg_pred_ret"])
-        votes   = int(top_row["votes"])
+        top_row    = conviction_df.iloc[0]
+        top_etf    = top_row["etf"]
+        conv       = float(top_row["conviction"])
+        avg_dir    = float(top_row["avg_dir_acc"])
+        avg_ret    = float(top_row["avg_pred_ret"])   # display only
+        votes      = int(top_row["votes"])
         vote_share = float(top_row["vote_share"])
-        avg_H   = float(top_row["avg_H"])
+        avg_H      = float(top_row["avg_H"])
 
-        ret_color  = "#16a34a" if avg_ret >= 0 else "#dc2626"
-        bg_color   = "#f0fdf4" if avg_ret >= 0 else "#fef2f2"
-        bdr_color  = "#bbf7d0" if avg_ret >= 0 else "#fecaca"
-        etf_color  = ETF_COLORS.get(top_etf, "#111827")
+        ret_color = "#16a34a" if avg_ret >= 0 else "#dc2626"
+        bg_color  = "#f0fdf4"
+        bdr_color = "#bbf7d0"
+        etf_color = ETF_COLORS.get(top_etf, "#111827")
 
         # ── Consensus hero banner ──────────────────────────────────────────
         signal_date_str = datetime.now().strftime("%A %b %d, %Y")
@@ -454,12 +470,17 @@ with tab_consensus:
                     <div style="font-size:28px; font-weight:800; color:#0284c7;">{votes}/{years_run} ({vote_share:.0%})</div>
                 </div>
                 <div>
-                    <div style="font-size:11px; color:#9ca3af; text-transform:uppercase; letter-spacing:1px;">Avg Predicted Return</div>
-                    <div style="font-size:28px; font-weight:800; color:{ret_color};">{'+' if avg_ret >= 0 else ''}{avg_ret:.3f}%</div>
+                    <div style="font-size:11px; color:#9ca3af; text-transform:uppercase; letter-spacing:1px;">Avg OOS Dir Accuracy</div>
+                    <div style="font-size:28px; font-weight:800; color:#d97706;">{avg_dir:.1f}%</div>
                 </div>
                 <div>
                     <div style="font-size:11px; color:#9ca3af; text-transform:uppercase; letter-spacing:1px;">Avg Hurst H</div>
-                    <div style="font-size:28px; font-weight:800; color:#d97706;">{avg_H:.3f}</div>
+                    <div style="font-size:28px; font-weight:800; color:#0ea5e9;">{avg_H:.3f}</div>
+                </div>
+                <div>
+                    <div style="font-size:11px; color:#9ca3af; text-transform:uppercase; letter-spacing:1px;">Avg Pred Return</div>
+                    <div style="font-size:28px; font-weight:800; color:{ret_color};">{'+' if avg_ret >= 0 else ''}{avg_ret:.3f}%</div>
+                    <div style="font-size:10px; color:#9ca3af;">display only · not in score</div>
                 </div>
             </div>
         </div>
@@ -471,22 +492,16 @@ with tab_consensus:
         for _, crow in conviction_df.iterrows():
             cidx    = (int(crow["rank"]) - 1) % 3
             cetf    = crow["etf"]
-            cret    = float(crow["avg_pred_ret"])
             cconv   = float(crow["conviction"])
             cvotes  = int(crow["votes"])
             cshare  = float(crow["vote_share"])
             cH      = float(crow["avg_H"])
             cdiracc = float(crow.get("avg_dir_acc", 0))
+            cret    = float(crow.get("avg_pred_ret", 0))
 
-            ret_col = "#16a34a" if cret > 0 else "#dc2626"
-            bg      = "#f8fafc"
-            bdr     = "#e2e8f0"
-            ec      = ETF_COLORS.get(cetf, "#374151")
-
-            # Highlight top pick
-            if int(crow["rank"]) == 1:
-                bg  = "#faf5ff"
-                bdr = "#c4b5fd"
+            ec  = ETF_COLORS.get(cetf, "#374151")
+            bg  = "#faf5ff" if int(crow["rank"]) == 1 else "#f8fafc"
+            bdr = "#c4b5fd" if int(crow["rank"]) == 1 else "#e2e8f0"
 
             with conv_cols[cidx]:
                 st.markdown(f"""
@@ -499,18 +514,21 @@ with tab_consensus:
                     <div style="font-size:18px; font-weight:700; color:#7c3aed; margin:4px 0;">
                         ⚡ {cconv:.3f} conviction
                     </div>
-                    <div style="font-size:13px; color:{ret_col}; font-weight:600;">
-                        Avg return: {'+' if cret > 0 else ''}{cret:.3f}%
+                    <div style="font-size:13px; color:#d97706; font-weight:600;">
+                        Dir Acc: {cdiracc:.1f}%
                     </div>
                     <div style="font-size:11px; color:#6b7280; margin-top:4px;">
-                        Votes: {cvotes}/{years_run} ({cshare:.0%}) · H={cH:.3f} · Dir Acc {cdiracc:.1f}%
+                        Votes: {cvotes}/{years_run} ({cshare:.0%}) · H={cH:.3f}
+                    </div>
+                    <div style="font-size:11px; color:#9ca3af; margin-top:2px;">
+                        Avg pred return: {'+' if cret >= 0 else ''}{cret:.3f}% <em>(display only)</em>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
 
         st.divider()
 
-        # ── Year-by-year vote heatmap ──────────────────────────────────────
+        # ── Year-by-year vote heatmap (WHITE background) ───────────────────
         if year_tops:
             st.subheader("🗳️ Year-by-Year Top Picks")
             st.caption("Which ETF ranked #1 for each training-start year window")
@@ -518,13 +536,6 @@ with tab_consensus:
             years_sorted = sorted(year_tops.keys())
             heat_etfs    = TARGET_ETFS
 
-            # Build binary matrix: rows=ETFs, cols=years
-            z = []
-            for etf in heat_etfs:
-                row = [1 if year_tops.get(yr) == etf else 0 for yr in years_sorted]
-                z.append(row)
-
-            # Colour by ETF index so each ETF has a unique shade
             z_colored = []
             for i, etf in enumerate(heat_etfs):
                 row = [(i + 1) if year_tops.get(yr) == etf else 0 for yr in years_sorted]
@@ -535,7 +546,7 @@ with tab_consensus:
                 x=[str(yr) for yr in years_sorted],
                 y=heat_etfs,
                 colorscale=[
-                    [0.0,  "#0f172a"],
+                    [0.0,  "#f1f5f9"],
                     [0.17, "#0ea5e9"],
                     [0.33, "#ec4899"],
                     [0.50, "#10b981"],
@@ -548,46 +559,50 @@ with tab_consensus:
                        for yr in years_sorted]
                       for etf in heat_etfs],
                 texttemplate="%{text}",
-                textfont={"size": 9, "color": "white"},
+                textfont={"size": 9, "color": "#1e293b"},
             ))
             fig_heat.update_layout(
                 height=280,
-                template="plotly_dark",
-                paper_bgcolor="#0f172a",
-                plot_bgcolor="#0a0e1a",
+                **CHART_LAYOUT,
                 title="Top Pick per Training Window",
-                xaxis=dict(title="Training Start Year", tickangle=0),
-                yaxis=dict(title=""),
+                xaxis=dict(title="Training Start Year", tickangle=0,
+                           gridcolor="#e2e8f0"),
+                yaxis=dict(title="", gridcolor="#e2e8f0"),
                 margin=dict(l=60, r=0, t=40, b=40),
             )
             st.plotly_chart(fig_heat, use_container_width=True)
 
-        # ── Conviction score breakdown bar chart ───────────────────────────
+        # ── Conviction score breakdown bar chart (WHITE background) ────────
         st.subheader("📐 Conviction Score Decomposition")
-        st.caption("How votes, return and Hurst contribute to each ETF's score")
+        st.caption(
+            "How vote share, OOS directional accuracy and Hurst H "
+            "contribute to each ETF's conviction score"
+        )
+
+        etf_list    = conviction_df["etf"].tolist()
+        vote_vals   = (conviction_df["vote_share"]   * CONVICTION_W["votes"]).tolist()
+        diracc_vals = (conviction_df["norm_dir_acc"] * CONVICTION_W["dir_acc"]).tolist()
+        hurst_vals  = (conviction_df["norm_H"]       * CONVICTION_W["hurst"]).tolist()
 
         fig_bar = go.Figure()
-        etf_list   = conviction_df["etf"].tolist()
-        vote_vals  = (conviction_df["vote_share"] * CONVICTION_WEIGHTS["votes"]).tolist()
-        ret_vals   = (conviction_df["norm_ret"]   * CONVICTION_WEIGHTS["return"]).tolist()
-        hurst_vals = (conviction_df["norm_H"]     * CONVICTION_WEIGHTS["hurst"]).tolist()
-
-        fig_bar.add_trace(go.Bar(name="Vote Share (40%)",   x=etf_list, y=vote_vals,
-                                  marker_color="#0284c7"))
-        fig_bar.add_trace(go.Bar(name="Avg Return (35%)",   x=etf_list, y=ret_vals,
-                                  marker_color="#16a34a"))
-        fig_bar.add_trace(go.Bar(name="Avg Hurst H (25%)",  x=etf_list, y=hurst_vals,
-                                  marker_color="#d97706"))
+        fig_bar.add_trace(go.Bar(
+            name=f"Vote Share ({int(CONVICTION_W['votes']*100)}%)",
+            x=etf_list, y=vote_vals, marker_color="#0284c7"))
+        fig_bar.add_trace(go.Bar(
+            name=f"OOS Dir Accuracy ({int(CONVICTION_W['dir_acc']*100)}%)",
+            x=etf_list, y=diracc_vals, marker_color="#d97706"))
+        fig_bar.add_trace(go.Bar(
+            name=f"Avg Hurst H ({int(CONVICTION_W['hurst']*100)}%)",
+            x=etf_list, y=hurst_vals, marker_color="#10b981"))
 
         fig_bar.update_layout(
             barmode="stack",
-            height=360,
-            template="plotly_dark",
-            paper_bgcolor="#0f172a",
-            plot_bgcolor="#0a0e1a",
-            title="Conviction Score = Votes × 0.40 + Return × 0.35 + Hurst × 0.25",
-            yaxis=dict(title="Score Contribution", gridcolor="#1e293b"),
-            legend=dict(bgcolor="#0f172a", bordercolor="#1e293b"),
+            height=380,
+            **CHART_LAYOUT,
+            title="Conviction = Votes×0.35 + Dir Accuracy×0.40 + Hurst H×0.25",
+            yaxis=dict(title="Score Contribution", gridcolor="#e2e8f0"),
+            xaxis=dict(gridcolor="#e2e8f0"),
+            legend=dict(bgcolor="#ffffff", bordercolor="#e2e8f0", borderwidth=1),
             margin=dict(l=0, r=0, t=40, b=0),
         )
         st.plotly_chart(fig_bar, use_container_width=True)
@@ -596,25 +611,35 @@ with tab_consensus:
         if flat_df is not None and len(flat_df) > 0:
             with st.expander("🔍 Per-Year Per-ETF Detail Table", expanded=False):
                 show_cols = [c for c in
-                             ["year", "etf", "pred_ret_pct", "H", "dir_acc", "model"]
+                             ["year", "etf", "pred_ret_pct", "dir_acc", "H", "mae", "rmse", "model"]
                              if c in flat_df.columns]
                 flat_show = flat_df[show_cols].copy()
-                flat_show.columns = [c.replace("pred_ret_pct", "Pred Ret %")
-                                      .replace("dir_acc", "Dir Acc %")
-                                      .replace("model", "Model")
-                                      .replace("year", "Year")
-                                      .replace("etf", "ETF")
-                                      .replace("H", "Hurst H")
-                                      for c in flat_show.columns]
-                st.dataframe(flat_show.sort_values(["Year", "Pred Ret %"],
-                                                    ascending=[True, False]),
-                             use_container_width=True, hide_index=True)
+                col_rename = {
+                    "year":         "Year",
+                    "etf":          "ETF",
+                    "pred_ret_pct": "Pred Ret %",
+                    "dir_acc":      "Dir Acc % ★",
+                    "H":            "Hurst H",
+                    "mae":          "MAE",
+                    "rmse":         "RMSE",
+                    "model":        "Model",
+                }
+                flat_show = flat_show.rename(columns=col_rename)
+                st.caption(
+                    "★ Dir Acc % = OOS directional accuracy: "
+                    "% of test-period days where predicted return direction matched actual. "
+                    "This drives 40% of the conviction score."
+                )
+                st.dataframe(
+                    flat_show.sort_values(["Year", "Dir Acc % ★"], ascending=[True, False]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-        # ── Auto-run reminder ──────────────────────────────────────────────
         st.info(
             "💡 **Tip:** The sweep runs automatically at 8 PM EST on weekdays via GitHub Actions. "
-            "To trigger it manually: GitHub repo → Actions → *Consensus Sweep* → *Run workflow*. "
-            "Only the 2 most recent stamped runs are kept on HuggingFace — older files are deleted automatically."
+            "To trigger manually: GitHub repo → Actions → *Consensus Sweep* → *Run workflow*. "
+            "Only the latest run is kept on HuggingFace — previous stamped files are deleted automatically."
         )
 
 
@@ -623,7 +648,7 @@ with tab_consensus:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
     st.subheader("OOS Period: Cumulative Return — Model Signal vs Benchmark")
-    st.caption("Cumulative actual return of the model's top-ranked ETF each day vs the selected benchmark. OOS = out-of-sample test period only.")
+    st.caption("Cumulative actual return of the model's top-ranked ETF each day vs the selected benchmark.")
 
     bench_choice = benchmark if benchmark != "None" else "SPY"
 
@@ -678,15 +703,15 @@ with tab1:
                 ))
 
             fig.update_layout(
-                height=440, template="plotly_dark",
-                paper_bgcolor="#0f172a", plot_bgcolor="#0a0e1a",
+                height=440,
+                **CHART_LAYOUT,
                 title="Cumulative Return — OOS Period (%)",
-                xaxis=dict(gridcolor="#1e293b", title="Date"),
-                yaxis=dict(gridcolor="#1e293b", title="Cumulative Return (%)"),
-                legend=dict(bgcolor="#0f172a", bordercolor="#1e293b"),
+                xaxis=dict(gridcolor="#e2e8f0", title="Date"),
+                yaxis=dict(gridcolor="#e2e8f0", title="Cumulative Return (%)"),
+                legend=dict(bgcolor="#ffffff", bordercolor="#e2e8f0", borderwidth=1),
                 margin=dict(l=0, r=0, t=40, b=0),
             )
-            fig.add_hline(y=0, line_color="#475569", line_dash="dot")
+            fig.add_hline(y=0, line_color="#94a3b8", line_dash="dot")
             st.plotly_chart(fig, use_container_width=True)
 
             total_ret = float(cum_signal.iloc[-1]) * 100
@@ -730,16 +755,16 @@ with tab2:
         n = len(df)
         if n < 2:
             return None
-        total_ret = float(df["cum"].iloc[-1]) - 1
-        ann_ret   = ((1 + total_ret) ** (252 / n) - 1) * 100
-        ann_vol   = df["ret"].std() * np.sqrt(252) * 100
-        sharpe    = ann_ret / ann_vol if ann_vol > 0 else 0
-        roll_max  = df["cum"].cummax()
-        drawdowns = (df["cum"] - roll_max) / roll_max
-        max_dd_pt = float(drawdowns.min()) * 100
+        total_ret  = float(df["cum"].iloc[-1]) - 1
+        ann_ret    = ((1 + total_ret) ** (252 / n) - 1) * 100
+        ann_vol    = df["ret"].std() * np.sqrt(252) * 100
+        sharpe     = ann_ret / ann_vol if ann_vol > 0 else 0
+        roll_max   = df["cum"].cummax()
+        drawdowns  = (df["cum"] - roll_max) / roll_max
+        max_dd_pt  = float(drawdowns.min()) * 100
         max_dd_day = float(df["ret"].min()) * 100
-        last15    = df.tail(15)
-        hit_ratio = (last15["ret"] > 0).sum() / len(last15) * 100 if len(last15) > 0 else 0
+        last15     = df.tail(15)
+        hit_ratio  = (last15["ret"] > 0).sum() / len(last15) * 100 if len(last15) > 0 else 0
         bench_stats = {}
         if bench_col in bench_ret_df.columns:
             b = bench_ret_df[bench_col].reindex(df.index).dropna()
@@ -781,7 +806,8 @@ with tab2:
             st.divider()
             if bench_ann is not None:
                 comp_data = {
-                    "Metric": ["Ann. Return", "Sharpe Ratio", "Max DD (P→T)", "Max DD (Day)", "Hit Ratio (15d)"],
+                    "Metric": ["Ann. Return", "Sharpe Ratio", "Max DD (P→T)",
+                               "Max DD (Day)", "Hit Ratio (15d)"],
                     "Model Signal": [f"{perf['ann_ret']:+.2f}%", f"{perf['sharpe']:.2f}",
                                      f"{perf['max_dd_pt']:.2f}%", f"{perf['max_dd_day']:.2f}%",
                                      f"{perf['hit_ratio']:.1f}%"],
@@ -809,22 +835,28 @@ with tab3:
 
     if metrics_df is not None and len(metrics_df) > 0:
         latest = metrics_df.sort_values("run_date").groupby("etf").last().reset_index()
-        fig_h = go.Figure()
+        fig_h  = go.Figure()
         for _, row in latest.iterrows():
             color = "#0ea5e9" if row["hurst_H"] > HURST_THRESH else "#f59e0b"
-            fig_h.add_trace(go.Bar(x=[row["etf"]], y=[row["hurst_H"]],
-                                   name=row["etf"], marker_color=color,
-                                   text=f"H={row['hurst_H']:.3f}", textposition="outside"))
+            fig_h.add_trace(go.Bar(
+                x=[row["etf"]], y=[row["hurst_H"]],
+                name=row["etf"], marker_color=color,
+                text=f"H={row['hurst_H']:.3f}", textposition="outside",
+            ))
         fig_h.add_hline(y=HURST_THRESH, line_dash="dash", line_color="#ef4444",
                         annotation_text=f"Long-memory threshold (H={HURST_THRESH})",
                         annotation_position="top right")
-        fig_h.add_hline(y=0.5, line_dash="dot", line_color="#64748b",
+        fig_h.add_hline(y=0.5, line_dash="dot", line_color="#94a3b8",
                         annotation_text="Random walk (H=0.5)")
-        fig_h.update_layout(height=380, template="plotly_dark",
-                            paper_bgcolor="#0f172a", plot_bgcolor="#0a0e1a",
-                            title="Hurst Exponent by ETF (latest training run)",
-                            yaxis=dict(range=[0.3, 0.75], gridcolor="#1e293b", title="H"),
-                            showlegend=False, margin=dict(l=0, r=0, t=40, b=0))
+        fig_h.update_layout(
+            height=380,
+            **CHART_LAYOUT,
+            title="Hurst Exponent by ETF (latest training run)",
+            yaxis=dict(range=[0.3, 0.75], gridcolor="#e2e8f0", title="H"),
+            xaxis=dict(gridcolor="#e2e8f0"),
+            showlegend=False,
+            margin=dict(l=0, r=0, t=40, b=0),
+        )
         st.plotly_chart(fig_h, use_container_width=True)
         hurst_tbl = latest[["etf", "hurst_H", "memory_type", "model_used"]].copy()
         hurst_tbl.columns = ["ETF", "Hurst H", "Memory Type", "Model Used"]
@@ -838,7 +870,7 @@ with tab3:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.subheader("📋 Audit Trail — Last 15 Trading Days")
-    st.caption("One row per day · Top pick ETF · Actual return from source data · N/A = today (market not yet closed)")
+    st.caption("One row per day · Top pick ETF · Actual return from source data · N/A = today")
 
     if rankings is not None and len(rankings) > 0 and ret_df is not None:
         today = pd.Timestamp(datetime.now().date())
@@ -888,8 +920,7 @@ with tab4:
                 "Dir Acc%":    round(row["direction_accuracy"], 1),
             })
 
-        display_df = pd.DataFrame(display_rows)
-        st.dataframe(display_df, use_container_width=True, hide_index=True,
+        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True,
                      column_config={
                          "Date":        st.column_config.TextColumn("Date"),
                          "Top Pick":    st.column_config.TextColumn("Top Pick"),
@@ -940,7 +971,7 @@ with tab5:
 
     | Stage | Model | Role |
     |-------|-------|------|
-    | **1** | SimpleRNN | Captures **short-term memory** (RNNs structurally cannot do long-term) |
+    | **1** | SimpleRNN | Captures **short-term memory** |
     | **2** | ResidualLSTM | Trained on RNN residuals → extracts **long-term memory** |
     | **3** | HybridLSTM | Fuses both → final refined forecast |
 
@@ -948,32 +979,35 @@ with tab5:
 
     ### 🌊 Hurst Decision Rule
     - **H > 0.52** → Use ARMA-RNN-LSTM hybrid
-    - **H ≈ 0.50** → Use RNN only (hybrid adds noise on random-walk series)
+    - **H ≈ 0.50** → Use RNN only
 
     ---
 
-    ### 🔁 Consensus Sweep
-    The **Consensus Sweep** tab trains all 17 training-start year windows (2008–2024)
-    in parallel and scores conviction using:
-    - **40%** vote share — how many windows agree on the same top ETF
-    - **35%** average predicted return across windows
-    - **25%** average Hurst H — strength of trend-persistence signal
+    ### 🔁 Consensus Sweep (v2)
+    Trains all 17 training-start year windows (2008–2024) in parallel and scores
+    conviction using:
 
-    Results are saved to HuggingFace with a UTC date stamp. Old stamped files are
-    cleaned up automatically — only the 2 most recent runs are retained.
+    | Component | Weight | What it measures |
+    |-----------|--------|-----------------|
+    | Vote share | **35%** | How many windows agree on the same top ETF |
+    | OOS Dir Accuracy | **40%** | % of test-period days where predicted direction matched actual |
+    | Avg Hurst H | **25%** | Trend-persistence signal strength |
+
+    Avg predicted return is shown for reference but **not used in scoring** — it has no
+    ground-truth anchor. OOS directional accuracy is the genuine predicted-vs-actual
+    sync measure.
 
     ---
 
     ### ⚙️ Fixed Parameters (paper-optimal)
-    | Parameter | Value | Rationale |
-    |-----------|-------|-----------|
-    | Train/Test split | **80/20** | Maximise training data |
-    | Hurst threshold | **0.52** | Paper §4.3 optimal |
-    | Lookback window | **10 days** | Paper setting |
+    | Parameter | Value |
+    |-----------|-------|
+    | Train/Test split | **80/20** |
+    | Hurst threshold | **0.52** |
+    | Lookback window | **10 days** |
 
     ---
 
     ### ⚠️ Disclaimer
     Educational and research purposes only. Not financial advice.
-    Past model performance does not guarantee future results.
     """)
