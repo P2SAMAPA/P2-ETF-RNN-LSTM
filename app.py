@@ -67,10 +67,10 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🔁 Consensus Sweep")
-    st.caption("Trains 2008–2024 windows in parallel and scores conviction.")
-    run_consensus = st.button("▶️ Run Consensus Sweep Now",
-                               use_container_width=True, type="primary",
-                               help="Runs all 17 training windows; takes ~5–15 min.")
+    st.caption("Reads latest conviction results from HuggingFace (trained nightly via GitHub Actions).")
+    refresh_consensus = st.button("🔄 Refresh Consensus Data",
+                                   use_container_width=True,
+                                   help="Re-fetch the latest consensus results from HuggingFace.")
 
 # ── Data loaders ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -344,51 +344,10 @@ if len(latest_rankings) > 0:
 
 st.divider()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CONSENSUS SWEEP — trigger & run (before tabs so banner shows above tabs)
-# ══════════════════════════════════════════════════════════════════════════════
-if run_consensus:
-    if price_df is None or ret_df is None:
-        st.error("❌ Cannot run consensus — price/return data not loaded.")
-    else:
-        from consensus import run_consensus_sweep, save_consensus_results
-
-        st.subheader("🔁 Consensus Sweep — Running…")
-        progress_bar  = st.progress(0.0, text="Initialising…")
-        status_box    = st.empty()
-        log_container = st.expander("📋 Per-year log", expanded=False)
-        log_lines     = []
-
-        def _progress(pct, msg):
-            progress_bar.progress(min(pct, 1.0), text=msg)
-            log_lines.append(msg)
-            with log_container:
-                st.text("\n".join(log_lines[-30:]))   # last 30 lines
-
-        with st.spinner("Running consensus sweep across 2008–2024…"):
-            sweep = run_consensus_sweep(
-                price_df=price_df,
-                ret_df=ret_df,
-                max_workers=4,
-                progress_callback=_progress,
-            )
-
-        # Store in session state
-        st.session_state["consensus_sweep"]  = sweep
-        st.session_state["consensus_ran"]    = True
-
-        # Try to persist to HF
-        token = os.environ.get("HF_TOKEN", "")
-        if token:
-            with st.spinner("Saving results to HuggingFace…"):
-                saved = save_consensus_results(sweep, token)
-            if saved:
-                load_consensus_from_hf.clear()   # invalidate cache
-                status_box.success("✅ Consensus results saved to HuggingFace.")
-            else:
-                status_box.warning("⚠️ Results computed but could not save to HF (check HF_TOKEN).")
-        else:
-            status_box.info("ℹ️ HF_TOKEN not set — results available for this session only.")
+# ── Consensus refresh ─────────────────────────────────────────────────────────
+if refresh_consensus:
+    load_consensus_from_hf.clear()
+    st.rerun()
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 tab1, tab_consensus, tab2, tab3, tab4, tab5 = st.tabs([
@@ -414,51 +373,31 @@ with tab_consensus:
         f"{int(CONVICTION_WEIGHTS['hurst']*100)}% avg Hurst H."
     )
 
-    # ── Source: prefer fresh session-state result, fall back to HF cache ──
-    session_sweep = st.session_state.get("consensus_sweep", None)
+    # ── Load from HF cache ────────────────────────────────────────────────────
+    conviction_df, flat_df = load_consensus_from_hf()
 
-    if session_sweep is not None:
-        conviction_df = session_sweep["conviction"]
-        flat_df       = pd.DataFrame(session_sweep["all_results"])
-        year_tops     = session_sweep["year_tops"]
-        run_ts        = session_sweep["run_ts"]
-        years_run     = session_sweep["years_run"]
-        years_failed  = session_sweep["years_failed"]
-        data_source   = "🚀 Fresh (just ran)"
+    if conviction_df is not None and len(conviction_df) > 0:
+        run_ts       = conviction_df["run_ts"].iloc[0] if "run_ts" in conviction_df.columns else "unknown"
+        years_run    = int(conviction_df["years_run"].iloc[0]) if "years_run" in conviction_df.columns else "?"
+        year_tops    = {}
+        if flat_df is not None and "year" in flat_df.columns and "pred_ret_pct" in flat_df.columns:
+            year_tops = (flat_df.sort_values("pred_ret_pct", ascending=False)
+                                .groupby("year").first()["etf"].to_dict())
+        data_source = f"📡 GitHub Actions run — {run_ts[:10] if run_ts != 'unknown' else '—'} UTC"
     else:
-        # Try HF
-        conviction_df, flat_df = load_consensus_from_hf()
-        if conviction_df is not None:
-            run_ts       = conviction_df["run_ts"].iloc[0] if "run_ts" in conviction_df.columns else "unknown"
-            years_run    = int(conviction_df["years_run"].iloc[0]) if "years_run" in conviction_df.columns else "?"
-            years_failed = "?"
-            year_tops    = {}
-            if flat_df is not None and "year" in flat_df.columns and "etf" in flat_df.columns:
-                for _, row in flat_df.iterrows():
-                    yr = row["year"]
-                    if yr not in year_tops or row["pred_ret_pct"] > flat_df[flat_df["year"] == yr]["pred_ret_pct"].max():
-                        pass
-                # simpler: top per year from flat
-                if "pred_ret_pct" in flat_df.columns:
-                    year_tops = (flat_df.sort_values("pred_ret_pct", ascending=False)
-                                       .groupby("year")
-                                       .first()["etf"]
-                                       .to_dict())
-            data_source = f"📡 Cached from HuggingFace (run: {run_ts[:10] if run_ts != 'unknown' else '—'})"
-        else:
-            conviction_df = None
-            flat_df       = None
-            run_ts        = None
-            years_run     = 0
-            years_failed  = 0
-            year_tops     = {}
-            data_source   = None
+        conviction_df = None
+        flat_df       = None
+        run_ts        = None
+        years_run     = 0
+        year_tops     = {}
+        data_source   = None
 
     # ── No data state ─────────────────────────────────────────────────────────
     if conviction_df is None or len(conviction_df) == 0:
         st.info(
-            "No consensus results yet. Click **▶️ Run Consensus Sweep Now** "
-            "in the sidebar to train all 17 windows and compute the conviction score."
+            "No consensus results yet. The GitHub Actions workflow runs automatically "
+            "at **8 PM EST weekdays**. You can also trigger it manually from the "
+            "**Actions tab** in your GitHub repo → *Consensus Sweep* → *Run workflow*."
         )
         st.markdown("""
         **How it works:**
@@ -673,9 +612,9 @@ with tab_consensus:
 
         # ── Auto-run reminder ──────────────────────────────────────────────
         st.info(
-            "💡 **Tip:** Results are saved to HuggingFace with a date stamp. "
-            "Run the sweep once per day (e.g. before 8 PM EST) for a fresh consensus signal. "
-            "Old stamped files are cleaned up automatically — only the 2 most recent runs are kept."
+            "💡 **Tip:** The sweep runs automatically at 8 PM EST on weekdays via GitHub Actions. "
+            "To trigger it manually: GitHub repo → Actions → *Consensus Sweep* → *Run workflow*. "
+            "Only the 2 most recent stamped runs are kept on HuggingFace — older files are deleted automatically."
         )
 
 
