@@ -54,7 +54,7 @@ np.random.seed(SEED)
 # ── Constants ──────────────────────────────────────────────────────────────────
 DEFAULT_YEARS   = list(range(2008, 2025))   # 2008 → 2024 inclusive
 CONSENSUS_DIR   = "consensus"
-KEEP_RUNS       = 2                          # stamped files to retain per type
+KEEP_RUNS       = 1                          # keep only the latest stamped run; wipe previous
 CONVICTION_W    = {"votes": 0.40, "ret": 0.35, "hurst": 0.25}
 
 ETF_LABELS = {
@@ -252,11 +252,9 @@ def _save_to_hf(conviction_df: pd.DataFrame, flat_df: pd.DataFrame,
                 f for f in all_files
                 if f.startswith(f"{CONSENSUS_DIR}/{prefix}_2")  # date-stamped only
             ])
-            # Remove everything except the KEEP_RUNS most recent
-            to_delete = candidates[:-KEEP_RUNS] if len(candidates) > KEEP_RUNS else []
+            # Delete everything that isn't the file we just uploaded
+            to_delete = [f for f in candidates if f != keep_this]
             for old in to_delete:
-                if old == keep_this:
-                    continue
                 try:
                     api.delete_file(path_in_repo=old,
                                     repo_id=HF_RESULTS_DATASET,
