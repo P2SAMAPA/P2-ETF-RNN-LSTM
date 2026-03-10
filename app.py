@@ -243,8 +243,17 @@ if live_ran and live_results:
 elif rankings is not None and len(rankings) > 0:
     signal_source   = "📡 Last Scheduled Run (GitHub Actions)"
     latest_rankings = rankings[rankings["date"] == rankings["date"].max()].sort_values("rank")
-    signal_date_str = latest_rankings.iloc[0]["date"].strftime("%A %b %d, %Y") \
-                      if len(latest_rankings) > 0 else ""
+    # The ranking date is the RUN date. The signal is FOR the next trading day.
+    if len(latest_rankings) > 0:
+        run_date = latest_rankings.iloc[0]["date"]
+        # Compute next trading day after run_date
+        from datetime import timedelta
+        target = run_date + timedelta(days=1)
+        while target.weekday() >= 5:
+            target += timedelta(days=1)
+        signal_date_str = target.strftime("%A %b %d, %Y")
+    else:
+        signal_date_str = ""
 else:
     latest_rankings = pd.DataFrame()
     signal_source   = ""
@@ -664,18 +673,32 @@ with tab4:
         rank1["date"] = pd.to_datetime(rank1["date"])
         rank1 = rank1.sort_values("date", ascending=False).head(AUDIT_ROWS)
 
+        # Pre-build audit lookup dict for fallback {(date, etf): actual_ret_pct}
+        audit_lookup = {}
+        if audit_df is not None:
+            af = audit_df.copy()
+            af["date"] = pd.to_datetime(af["date"])
+            af_filled = af[af["actual_ret_pct"].notna()]
+            for _, ar in af_filled.iterrows():
+                audit_lookup[(ar["date"], ar["signal_etf"])] = float(ar["actual_ret_pct"])
+
         display_rows = []
         for _, row in rank1.iterrows():
             d   = row["date"]
             etf = row["etf"]
 
-            # Look up actual return directly from ret_df
+            # Lookup priority:
+            # 1. ret_df (source dataset — most reliable, may lag 1-2 days)
+            # 2. audit_df backfilled actual_ret_pct (train.py fills this T+1)
+            # 3. N/A — today or data genuinely not yet available
             if d >= today:
-                actual_ret = None          # today — market not closed
+                actual_ret = None          # today — market not yet closed
             elif etf in ret_df.columns and d in ret_df.index:
                 actual_ret = round(float(ret_df.loc[d, etf]) * 100, 4)
+            elif (d, etf) in audit_lookup:
+                actual_ret = round(audit_lookup[(d, etf)], 4)
             else:
-                actual_ret = None          # date not in source data yet
+                actual_ret = None          # source data not yet updated
 
             pred = row["predicted_return_pct"]
             result = ("✅" if actual_ret is not None and actual_ret > 0
