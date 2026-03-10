@@ -643,92 +643,96 @@ with tab3:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — AUDIT TRAIL  (fixed 15 days, all 6 ETFs per day, actual returns)
+# TAB 4 — AUDIT TRAIL
+# One row per day. Top pick ETF only. Actual return looked up directly
+# from ret_df for that ETF on that date. N/A only for today.
 # ══════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.subheader("📋 Audit Trail — Last 15 Trading Days")
-    st.caption("Today's actual return = N/A (backfilled next trading day by train.py). All 6 ETFs shown per day.")
+    st.caption("One row per day · Top pick ETF · Actual return from source data · N/A = today (market not yet closed)")
 
-    if audit_df is not None and len(audit_df) > 0 and ret_df is not None:
+    if rankings is not None and len(rankings) > 0 and ret_df is not None:
 
-        audit_work = audit_df.copy()
-        audit_work["date"] = pd.to_datetime(audit_work["date"])
+        today = pd.Timestamp(datetime.now().date())
 
-        # Get the 15 most recent distinct dates
-        recent_dates = sorted(audit_work["date"].unique(), reverse=True)[:AUDIT_ROWS]
-        audit_work   = audit_work[audit_work["date"].isin(recent_dates)].copy()
+        # Get rank-1 signal per date — this is the single source of truth
+        rank1 = (rankings[rankings["rank"] == 1]
+                 [["date", "etf", "predicted_return_pct",
+                   "hurst_H", "model_used", "direction_accuracy",
+                   "current_price", "predicted_price"]]
+                 .copy())
+        rank1["date"] = pd.to_datetime(rank1["date"])
+        rank1 = rank1.sort_values("date", ascending=False).head(AUDIT_ROWS)
 
-        # For each row, look up the actual ETF return from ret_df
-        def get_actual_ret(row):
-            d   = row["date"]
-            etf = row["signal_etf"]
-            today = pd.Timestamp(datetime.now().date())
-            # If date is today → N/A (not yet known)
-            if d >= today:
-                return None
-            if etf in ret_df.columns and d in ret_df.index:
-                return round(float(ret_df.loc[d, etf]) * 100, 4)
-            return None
-
-        audit_work["actual_ret_pct"] = audit_work.apply(get_actual_ret, axis=1)
-
-        # Identify top pick per date (rank 1)
-        top_picks = {}
-        if rankings is not None:
-            r1 = rankings[rankings["rank"] == 1][["date", "etf"]]
-            r1["date"] = pd.to_datetime(r1["date"])
-            top_picks = dict(zip(r1["date"], r1["etf"]))
-
-        # Build display table
         display_rows = []
-        for _, row in audit_work.sort_values(["date", "signal_etf"],
-                                               ascending=[False, True]).iterrows():
-            is_top = top_picks.get(row["date"]) == row["signal_etf"]
-            actual = row["actual_ret_pct"]
+        for _, row in rank1.iterrows():
+            d   = row["date"]
+            etf = row["etf"]
+
+            # Look up actual return directly from ret_df
+            if d >= today:
+                actual_ret = None          # today — market not closed
+            elif etf in ret_df.columns and d in ret_df.index:
+                actual_ret = round(float(ret_df.loc[d, etf]) * 100, 4)
+            else:
+                actual_ret = None          # date not in source data yet
+
+            pred = row["predicted_return_pct"]
+            result = ("✅" if actual_ret is not None and actual_ret > 0
+                      else ("❌" if actual_ret is not None and actual_ret <= 0
+                            else "⏳"))
+
+            # Direction correct?
+            dir_correct = "—"
+            if actual_ret is not None and pd.notna(pred):
+                dir_correct = "✅" if (pred > 0) == (actual_ret > 0) else "❌"
+
             display_rows.append({
-                "Date":           row["date"].strftime("%Y-%m-%d"),
-                "ETF":            ("⭐ " if is_top else "") + row["signal_etf"],
-                "Predicted Ret%": f"{row['predicted_ret_pct']:+.3f}%"
-                                  if pd.notna(row.get("predicted_ret_pct")) else "—",
-                "Actual Ret%":    f"{actual:+.3f}%" if actual is not None else "N/A",
-                "Result":         ("✅" if actual is not None and actual > 0
-                                   else ("❌" if actual is not None and actual <= 0
-                                         else "⏳")),
-                "Hurst H":        round(row["hurst_H"], 3) if pd.notna(row.get("hurst_H")) else "—",
-                "Model":          row.get("model_used", "—"),
-                "Dir Acc%":       round(row.get("direction_accuracy", 0), 1),
+                "Date":          d.strftime("%Y-%m-%d"),
+                "Top Pick":      etf,
+                "Pred Ret%":     f"{pred:+.3f}%" if pd.notna(pred) else "—",
+                "Actual Ret%":   f"{actual_ret:+.3f}%" if actual_ret is not None else "N/A",
+                "Return":        result,
+                "Direction":     dir_correct,
+                "Hurst H":       round(row["hurst_H"], 3),
+                "Model":         row["model_used"],
+                "Dir Acc%":      round(row["direction_accuracy"], 1),
             })
 
         display_df = pd.DataFrame(display_rows)
-        st.dataframe(display_df, use_container_width=True, hide_index=True,
-                     column_config={
-                         "Date":           st.column_config.TextColumn("Date", width="small"),
-                         "ETF":            st.column_config.TextColumn("ETF", width="small"),
-                         "Predicted Ret%": st.column_config.TextColumn("Pred Ret%"),
-                         "Actual Ret%":    st.column_config.TextColumn("Actual Ret%"),
-                         "Result":         st.column_config.TextColumn("✓/✗", width="small"),
-                         "Hurst H":        st.column_config.NumberColumn("H", format="%.3f"),
-                         "Model":          st.column_config.TextColumn("Model"),
-                         "Dir Acc%":       st.column_config.NumberColumn("Dir Acc%", format="%.1f"),
-                     })
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Date":        st.column_config.TextColumn("Date"),
+                "Top Pick":    st.column_config.TextColumn("Top Pick"),
+                "Pred Ret%":   st.column_config.TextColumn("Pred Ret%"),
+                "Actual Ret%": st.column_config.TextColumn("Actual Ret%"),
+                "Return":      st.column_config.TextColumn("Return", width="small"),
+                "Direction":   st.column_config.TextColumn("Dir OK?", width="small"),
+                "Hurst H":     st.column_config.NumberColumn("Hurst H", format="%.3f"),
+                "Model":       st.column_config.TextColumn("Model"),
+                "Dir Acc%":    st.column_config.NumberColumn("OOS Acc%", format="%.1f"),
+            },
+        )
 
-        # Win rate for ⭐ top pick rows only (where actual is known)
-        top_rows = [r for r in display_rows
-                    if r["ETF"].startswith("⭐") and r["Actual Ret%"] not in ("N/A", "—")]
-        if top_rows:
-            wins  = sum(1 for r in top_rows if float(r["Actual Ret%"].replace("%","")) > 0)
-            total = len(top_rows)
-            avg   = np.mean([float(r["Actual Ret%"].replace("%","")) for r in top_rows])
+        # Summary for rows where actual is known
+        known = [r for r in display_rows if r["Actual Ret%"] != "N/A"]
+        if known:
+            wins    = sum(1 for r in known if float(r["Actual Ret%"].replace("%", "")) > 0)
+            total   = len(known)
+            avg_ret = np.mean([float(r["Actual Ret%"].replace("%", "")) for r in known])
             st.divider()
-            st.caption("⭐ Top Pick performance summary")
             wc1, wc2, wc3 = st.columns(3)
-            wc1.metric("Hit Ratio (Top Pick)", f"{wins/total*100:.1f}%")
-            wc2.metric("Signals Evaluated", total)
-            wc3.metric("Avg Actual Return", f"{avg:+.3f}%")
+            wc1.metric("Hit Ratio", f"{wins/total*100:.1f}%",
+                       help="% of days where top pick had positive actual return")
+            wc2.metric("Days Evaluated", total)
+            wc3.metric("Avg Actual Return", f"{avg_ret:+.3f}%")
 
     else:
         st.info("Audit trail will populate after the first training run.")
-        st.caption("Actual returns are backfilled the following trading day — N/A for the most recent date is expected.")
+        st.caption("Actual returns are looked up directly from the source dataset — no backfill needed.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
