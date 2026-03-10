@@ -1,4 +1,4 @@
-# app.py  — P2-ETF-RNN-LSTM  (updated UI)
+# app.py  — P2-ETF-RNN-LSTM  (updated UI + Consensus Sweep tab)
 
 import os
 import warnings
@@ -25,9 +25,9 @@ st.set_page_config(
 HF_RESULTS  = "P2SAMAPA/p2-etf-rnn-lstm-results"
 HF_SOURCE   = "P2SAMAPA/p2-etf-deepwave-dl"
 TARGET_ETFS = ["TLT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
-TRAIN_SPLIT = 0.80          # fixed 80/20 — paper-aligned, no slider
-AUDIT_ROWS  = 15            # fixed 15 days
-HURST_THRESH = 0.52         # paper optimal threshold
+TRAIN_SPLIT = 0.80
+AUDIT_ROWS  = 15
+HURST_THRESH = 0.52
 
 ETF_LABELS = {
     "TLT": "iShares 20yr Treasury",
@@ -42,6 +42,7 @@ ETF_COLORS = {
     "VNQ": "#8b5cf6", "GLD": "#f59e0b", "SLV": "#94a3b8",
     "SPY": "#6366f1", "AGG": "#84cc16",
 }
+CONVICTION_WEIGHTS = {"votes": 0.40, "return": 0.35, "hurst": 0.25}
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -52,8 +53,6 @@ with st.sidebar:
     st.divider()
 
     st.subheader("⚙️ Configuration")
-
-    # Training start year slider (2008–2025)
     start_year = st.slider("Training Data From (Year)", 2008, 2025, 2010,
                             help="Use data from this year onwards for training")
     st.divider()
@@ -65,6 +64,13 @@ with st.sidebar:
     force_refresh = st.button("🔄 Force Data Refresh", use_container_width=True)
     run_inference = st.button("🚀 Run Live Inference", use_container_width=True,
                                type="primary")
+
+    st.divider()
+    st.subheader("🔁 Consensus Sweep")
+    st.caption("Trains 2008–2024 windows in parallel and scores conviction.")
+    run_consensus = st.button("▶️ Run Consensus Sweep Now",
+                               use_container_width=True, type="primary",
+                               help="Runs all 17 training windows; takes ~5–15 min.")
 
 # ── Data loaders ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -98,9 +104,20 @@ def load_source_parquet(filename: str) -> pd.DataFrame | None:
         return None
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_consensus_from_hf() -> tuple:
+    """Load cached consensus results from HF (fast, no re-training)."""
+    try:
+        from consensus import load_consensus_results
+        return load_consensus_results()
+    except Exception:
+        return None, None
+
+
 def clear_cache():
     load_results_parquet.clear()
     load_source_parquet.clear()
+    load_consensus_from_hf.clear()
 
 
 if force_refresh:
@@ -148,7 +165,7 @@ else:
 st.divider()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LIVE INFERENCE FUNCTION  (defined before use)
+# LIVE INFERENCE FUNCTION
 # ══════════════════════════════════════════════════════════════════════════════
 def _run_live_inference(price_df, ret_df, start_year):
     if price_df is None:
@@ -208,18 +225,15 @@ def _run_live_inference(price_df, ret_df, start_year):
     progress.progress(1.0, text="Done!")
     if results:
         results.sort(key=lambda x: x["pred_ret_pct"], reverse=True)
-        # Store in session state — hero banner will use these instead of HF rankings
         st.session_state["live_results"] = results
         st.session_state["live_ran"]     = True
-        st.success(f"✅ Live inference complete — signals updated below ↓")
+        st.success("✅ Live inference complete — signals updated below ↓")
 
 
-# ── Live Inference call ────────────────────────────────────────────────────────
 if run_inference:
     _run_live_inference(price_df, ret_df, start_year)
 
-# ── Determine signal source ───────────────────────────────────────────────────
-# Live inference overrides HF rankings to avoid showing two conflicting signals.
+# ── Determine signal source ────────────────────────────────────────────────────
 live_ran     = st.session_state.get("live_ran", False)
 live_results = st.session_state.get("live_results", [])
 
@@ -243,10 +257,8 @@ if live_ran and live_results:
 elif rankings is not None and len(rankings) > 0:
     signal_source   = "📡 Last Scheduled Run (GitHub Actions)"
     latest_rankings = rankings[rankings["date"] == rankings["date"].max()].sort_values("rank")
-    # The ranking date is the RUN date. The signal is FOR the next trading day.
     if len(latest_rankings) > 0:
         run_date = latest_rankings.iloc[0]["date"]
-        # Compute next trading day after run_date
         from datetime import timedelta
         target = run_date + timedelta(days=1)
         while target.weekday() >= 5:
@@ -267,7 +279,6 @@ if len(latest_rankings) > 0:
     bg_color  = "#f0fdf4" if ret >= 0 else "#fef2f2"
     bdr_color = "#bbf7d0" if ret >= 0 else "#fecaca"
 
-    # Show which source these signals come from — avoids confusion
     st.caption(f"Signal source: {signal_source}")
 
     st.markdown(f"""
@@ -298,7 +309,6 @@ if len(latest_rankings) > 0:
     </div>
     """, unsafe_allow_html=True)
 
-    # ── All ETF prediction cards ───────────────────────────────────────────
     st.subheader("📊 All ETF Predictions — Next Trading Day")
     pred_cols = st.columns(3)
     for i, row in latest_rankings.iterrows():
@@ -334,14 +344,340 @@ if len(latest_rankings) > 0:
 
 st.divider()
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSENSUS SWEEP — trigger & run (before tabs so banner shows above tabs)
+# ══════════════════════════════════════════════════════════════════════════════
+if run_consensus:
+    if price_df is None or ret_df is None:
+        st.error("❌ Cannot run consensus — price/return data not loaded.")
+    else:
+        from consensus import run_consensus_sweep, save_consensus_results
+
+        st.subheader("🔁 Consensus Sweep — Running…")
+        progress_bar  = st.progress(0.0, text="Initialising…")
+        status_box    = st.empty()
+        log_container = st.expander("📋 Per-year log", expanded=False)
+        log_lines     = []
+
+        def _progress(pct, msg):
+            progress_bar.progress(min(pct, 1.0), text=msg)
+            log_lines.append(msg)
+            with log_container:
+                st.text("\n".join(log_lines[-30:]))   # last 30 lines
+
+        with st.spinner("Running consensus sweep across 2008–2024…"):
+            sweep = run_consensus_sweep(
+                price_df=price_df,
+                ret_df=ret_df,
+                max_workers=4,
+                progress_callback=_progress,
+            )
+
+        # Store in session state
+        st.session_state["consensus_sweep"]  = sweep
+        st.session_state["consensus_ran"]    = True
+
+        # Try to persist to HF
+        token = os.environ.get("HF_TOKEN", "")
+        if token:
+            with st.spinner("Saving results to HuggingFace…"):
+                saved = save_consensus_results(sweep, token)
+            if saved:
+                load_consensus_from_hf.clear()   # invalidate cache
+                status_box.success("✅ Consensus results saved to HuggingFace.")
+            else:
+                status_box.warning("⚠️ Results computed but could not save to HF (check HF_TOKEN).")
+        else:
+            status_box.info("ℹ️ HF_TOKEN not set — results available for this session only.")
+
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab_consensus, tab2, tab3, tab4, tab5 = st.tabs([
     "📈 OOS Forecast Chart",
+    "🔁 Consensus Sweep",
     "📊 Model Performance",
     "🌊 Hurst Analysis",
     "📋 Audit Trail",
     "ℹ️ About the Model",
 ])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB — CONSENSUS SWEEP
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_consensus:
+    st.subheader("🔁 Consensus Sweep — All Training Windows (2008–2024)")
+    st.caption(
+        "Each year from 2008 to 2024 is used as a training-start cutoff. "
+        "All 17 windows run in parallel and their signals are combined via "
+        "a weighted conviction score: "
+        f"{int(CONVICTION_WEIGHTS['votes']*100)}% vote share · "
+        f"{int(CONVICTION_WEIGHTS['return']*100)}% avg predicted return · "
+        f"{int(CONVICTION_WEIGHTS['hurst']*100)}% avg Hurst H."
+    )
+
+    # ── Source: prefer fresh session-state result, fall back to HF cache ──
+    session_sweep = st.session_state.get("consensus_sweep", None)
+
+    if session_sweep is not None:
+        conviction_df = session_sweep["conviction"]
+        flat_df       = pd.DataFrame(session_sweep["all_results"])
+        year_tops     = session_sweep["year_tops"]
+        run_ts        = session_sweep["run_ts"]
+        years_run     = session_sweep["years_run"]
+        years_failed  = session_sweep["years_failed"]
+        data_source   = "🚀 Fresh (just ran)"
+    else:
+        # Try HF
+        conviction_df, flat_df = load_consensus_from_hf()
+        if conviction_df is not None:
+            run_ts       = conviction_df["run_ts"].iloc[0] if "run_ts" in conviction_df.columns else "unknown"
+            years_run    = int(conviction_df["years_run"].iloc[0]) if "years_run" in conviction_df.columns else "?"
+            years_failed = "?"
+            year_tops    = {}
+            if flat_df is not None and "year" in flat_df.columns and "etf" in flat_df.columns:
+                for _, row in flat_df.iterrows():
+                    yr = row["year"]
+                    if yr not in year_tops or row["pred_ret_pct"] > flat_df[flat_df["year"] == yr]["pred_ret_pct"].max():
+                        pass
+                # simpler: top per year from flat
+                if "pred_ret_pct" in flat_df.columns:
+                    year_tops = (flat_df.sort_values("pred_ret_pct", ascending=False)
+                                       .groupby("year")
+                                       .first()["etf"]
+                                       .to_dict())
+            data_source = f"📡 Cached from HuggingFace (run: {run_ts[:10] if run_ts != 'unknown' else '—'})"
+        else:
+            conviction_df = None
+            flat_df       = None
+            run_ts        = None
+            years_run     = 0
+            years_failed  = 0
+            year_tops     = {}
+            data_source   = None
+
+    # ── No data state ─────────────────────────────────────────────────────────
+    if conviction_df is None or len(conviction_df) == 0:
+        st.info(
+            "No consensus results yet. Click **▶️ Run Consensus Sweep Now** "
+            "in the sidebar to train all 17 windows and compute the conviction score."
+        )
+        st.markdown("""
+        **How it works:**
+        1. Trains the ARMA-RNN-LSTM pipeline for each start year (2008 → 2024) in parallel threads
+        2. Each window produces a top-ranked ETF for the next trading day
+        3. Signals are combined using a weighted conviction formula:
+           - **40%** — vote share (how many windows agree on this ETF)
+           - **35%** — average predicted return across windows
+           - **25%** — average Hurst H (trend-persistence signal strength)
+        4. Results are saved to HuggingFace with a date-stamp and cleaned up automatically
+        """)
+    else:
+        # ── Run metadata ──────────────────────────────────────────────────────
+        st.caption(f"Source: {data_source} · {years_run} windows ran · "
+                   f"Date: {run_ts[:10] if run_ts else '—'}")
+
+        top_row = conviction_df.iloc[0]
+        top_etf = top_row["etf"]
+        conv    = float(top_row["conviction"])
+        avg_ret = float(top_row["avg_pred_ret"])
+        votes   = int(top_row["votes"])
+        vote_share = float(top_row["vote_share"])
+        avg_H   = float(top_row["avg_H"])
+
+        ret_color  = "#16a34a" if avg_ret >= 0 else "#dc2626"
+        bg_color   = "#f0fdf4" if avg_ret >= 0 else "#fef2f2"
+        bdr_color  = "#bbf7d0" if avg_ret >= 0 else "#fecaca"
+        etf_color  = ETF_COLORS.get(top_etf, "#111827")
+
+        # ── Consensus hero banner ──────────────────────────────────────────
+        signal_date_str = datetime.now().strftime("%A %b %d, %Y")
+        st.markdown(f"""
+        <div style="background:{bg_color}; border:2px solid {bdr_color};
+                    border-radius:14px; padding:26px 32px; margin-bottom:20px;">
+            <div style="font-size:11px; letter-spacing:3px; color:#6b7280; margin-bottom:8px;">
+                CONSENSUS SIGNAL — {signal_date_str}
+                <span style="float:right; font-size:10px; color:#9ca3af;">
+                    CONVICTION SWEEP · 2008–2024
+                </span>
+            </div>
+            <div style="font-size:58px; font-weight:900; color:{etf_color}; line-height:1;">
+                {top_etf}
+            </div>
+            <div style="font-size:14px; color:#6b7280; margin-top:4px;">
+                {ETF_LABELS.get(top_etf, '')}
+            </div>
+            <div style="margin-top:14px; display:flex; gap:32px; flex-wrap:wrap;">
+                <div>
+                    <div style="font-size:11px; color:#9ca3af; text-transform:uppercase; letter-spacing:1px;">Conviction Score</div>
+                    <div style="font-size:28px; font-weight:800; color:#7c3aed;">{conv:.3f}</div>
+                </div>
+                <div>
+                    <div style="font-size:11px; color:#9ca3af; text-transform:uppercase; letter-spacing:1px;">Vote Share</div>
+                    <div style="font-size:28px; font-weight:800; color:#0284c7;">{votes}/{years_run} ({vote_share:.0%})</div>
+                </div>
+                <div>
+                    <div style="font-size:11px; color:#9ca3af; text-transform:uppercase; letter-spacing:1px;">Avg Predicted Return</div>
+                    <div style="font-size:28px; font-weight:800; color:{ret_color};">{'+' if avg_ret >= 0 else ''}{avg_ret:.3f}%</div>
+                </div>
+                <div>
+                    <div style="font-size:11px; color:#9ca3af; text-transform:uppercase; letter-spacing:1px;">Avg Hurst H</div>
+                    <div style="font-size:28px; font-weight:800; color:#d97706;">{avg_H:.3f}</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── All ETF conviction cards ───────────────────────────────────────
+        st.subheader("📊 Full ETF Conviction Rankings")
+        conv_cols = st.columns(3)
+        for _, crow in conviction_df.iterrows():
+            cidx    = (int(crow["rank"]) - 1) % 3
+            cetf    = crow["etf"]
+            cret    = float(crow["avg_pred_ret"])
+            cconv   = float(crow["conviction"])
+            cvotes  = int(crow["votes"])
+            cshare  = float(crow["vote_share"])
+            cH      = float(crow["avg_H"])
+            cdiracc = float(crow.get("avg_dir_acc", 0))
+
+            ret_col = "#16a34a" if cret > 0 else "#dc2626"
+            bg      = "#f8fafc"
+            bdr     = "#e2e8f0"
+            ec      = ETF_COLORS.get(cetf, "#374151")
+
+            # Highlight top pick
+            if int(crow["rank"]) == 1:
+                bg  = "#faf5ff"
+                bdr = "#c4b5fd"
+
+            with conv_cols[cidx]:
+                st.markdown(f"""
+                <div style="border:1px solid {bdr}; border-radius:10px;
+                            padding:16px; margin-bottom:12px; background:{bg};">
+                    <div style="font-size:10px; color:#9ca3af; margin-bottom:4px;">
+                        #{int(crow['rank'])} · {ETF_LABELS.get(cetf, cetf)}
+                    </div>
+                    <div style="font-size:26px; font-weight:900; color:{ec};">{cetf}</div>
+                    <div style="font-size:18px; font-weight:700; color:#7c3aed; margin:4px 0;">
+                        ⚡ {cconv:.3f} conviction
+                    </div>
+                    <div style="font-size:13px; color:{ret_col}; font-weight:600;">
+                        Avg return: {'+' if cret > 0 else ''}{cret:.3f}%
+                    </div>
+                    <div style="font-size:11px; color:#6b7280; margin-top:4px;">
+                        Votes: {cvotes}/{years_run} ({cshare:.0%}) · H={cH:.3f} · Dir Acc {cdiracc:.1f}%
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── Year-by-year vote heatmap ──────────────────────────────────────
+        if year_tops:
+            st.subheader("🗳️ Year-by-Year Top Picks")
+            st.caption("Which ETF ranked #1 for each training-start year window")
+
+            years_sorted = sorted(year_tops.keys())
+            heat_etfs    = TARGET_ETFS
+
+            # Build binary matrix: rows=ETFs, cols=years
+            z = []
+            for etf in heat_etfs:
+                row = [1 if year_tops.get(yr) == etf else 0 for yr in years_sorted]
+                z.append(row)
+
+            # Colour by ETF index so each ETF has a unique shade
+            z_colored = []
+            for i, etf in enumerate(heat_etfs):
+                row = [(i + 1) if year_tops.get(yr) == etf else 0 for yr in years_sorted]
+                z_colored.append(row)
+
+            fig_heat = go.Figure(go.Heatmap(
+                z=z_colored,
+                x=[str(yr) for yr in years_sorted],
+                y=heat_etfs,
+                colorscale=[
+                    [0.0,  "#0f172a"],
+                    [0.17, "#0ea5e9"],
+                    [0.33, "#ec4899"],
+                    [0.50, "#10b981"],
+                    [0.67, "#8b5cf6"],
+                    [0.83, "#f59e0b"],
+                    [1.0,  "#94a3b8"],
+                ],
+                showscale=False,
+                text=[[year_tops.get(yr, "") if year_tops.get(yr) == etf else ""
+                       for yr in years_sorted]
+                      for etf in heat_etfs],
+                texttemplate="%{text}",
+                textfont={"size": 9, "color": "white"},
+            ))
+            fig_heat.update_layout(
+                height=280,
+                template="plotly_dark",
+                paper_bgcolor="#0f172a",
+                plot_bgcolor="#0a0e1a",
+                title="Top Pick per Training Window",
+                xaxis=dict(title="Training Start Year", tickangle=0),
+                yaxis=dict(title=""),
+                margin=dict(l=60, r=0, t=40, b=40),
+            )
+            st.plotly_chart(fig_heat, use_container_width=True)
+
+        # ── Conviction score breakdown bar chart ───────────────────────────
+        st.subheader("📐 Conviction Score Decomposition")
+        st.caption("How votes, return and Hurst contribute to each ETF's score")
+
+        fig_bar = go.Figure()
+        etf_list   = conviction_df["etf"].tolist()
+        vote_vals  = (conviction_df["vote_share"] * CONVICTION_WEIGHTS["votes"]).tolist()
+        ret_vals   = (conviction_df["norm_ret"]   * CONVICTION_WEIGHTS["return"]).tolist()
+        hurst_vals = (conviction_df["norm_H"]     * CONVICTION_WEIGHTS["hurst"]).tolist()
+
+        fig_bar.add_trace(go.Bar(name="Vote Share (40%)",   x=etf_list, y=vote_vals,
+                                  marker_color="#0284c7"))
+        fig_bar.add_trace(go.Bar(name="Avg Return (35%)",   x=etf_list, y=ret_vals,
+                                  marker_color="#16a34a"))
+        fig_bar.add_trace(go.Bar(name="Avg Hurst H (25%)",  x=etf_list, y=hurst_vals,
+                                  marker_color="#d97706"))
+
+        fig_bar.update_layout(
+            barmode="stack",
+            height=360,
+            template="plotly_dark",
+            paper_bgcolor="#0f172a",
+            plot_bgcolor="#0a0e1a",
+            title="Conviction Score = Votes × 0.40 + Return × 0.35 + Hurst × 0.25",
+            yaxis=dict(title="Score Contribution", gridcolor="#1e293b"),
+            legend=dict(bgcolor="#0f172a", bordercolor="#1e293b"),
+            margin=dict(l=0, r=0, t=40, b=0),
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+        # ── Per-year flat detail table ─────────────────────────────────────
+        if flat_df is not None and len(flat_df) > 0:
+            with st.expander("🔍 Per-Year Per-ETF Detail Table", expanded=False):
+                show_cols = [c for c in
+                             ["year", "etf", "pred_ret_pct", "H", "dir_acc", "model"]
+                             if c in flat_df.columns]
+                flat_show = flat_df[show_cols].copy()
+                flat_show.columns = [c.replace("pred_ret_pct", "Pred Ret %")
+                                      .replace("dir_acc", "Dir Acc %")
+                                      .replace("model", "Model")
+                                      .replace("year", "Year")
+                                      .replace("etf", "ETF")
+                                      .replace("H", "Hurst H")
+                                      for c in flat_show.columns]
+                st.dataframe(flat_show.sort_values(["Year", "Pred Ret %"],
+                                                    ascending=[True, False]),
+                             use_container_width=True, hide_index=True)
+
+        # ── Auto-run reminder ──────────────────────────────────────────────
+        st.info(
+            "💡 **Tip:** Results are saved to HuggingFace with a date stamp. "
+            "Run the sweep once per day (e.g. before 8 PM EST) for a fresh consensus signal. "
+            "Old stamped files are cleaned up automatically — only the 2 most recent runs are kept."
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — OOS CUMULATIVE RETURN CHART
@@ -354,14 +690,10 @@ with tab1:
 
     if audit_df is not None and len(audit_df) > 0 and ret_df is not None:
 
-        # Build OOS signal series from audit trail
-        # For each date, the top signal ETF is the one with rank=1 in rankings
-        # We then look up the ACTUAL return of that ETF on that date
         oos = audit_df.copy()
         oos["date"] = pd.to_datetime(oos["date"])
         oos = oos.sort_values("date")
 
-        # Get rank-1 signals per date
         if rankings is not None:
             rank1 = (rankings[rankings["rank"] == 1][["date", "etf"]]
                      .rename(columns={"etf": "top_etf"}))
@@ -372,7 +704,6 @@ with tab1:
                             if "predicted_ret_pct" in g.columns else g.iloc[0]["signal_etf"])
                      .reset_index().rename(columns={0: "top_etf"}))
 
-        # Merge with actual returns
         signal_rets = []
         for _, row in rank1.iterrows():
             d   = row["date"]
@@ -384,40 +715,32 @@ with tab1:
 
         signal_df = pd.DataFrame(signal_rets).dropna().set_index("date").sort_index()
 
-        # Benchmark returns for same dates
         bench_rets = None
         if bench_choice != "None" and bench_ret is not None and bench_choice in bench_ret.columns:
             bench_rets = bench_ret[bench_choice].reindex(signal_df.index).dropna()
 
         if len(signal_df) >= 2:
-            # Cumulative returns (compound)
             cum_signal = (1 + signal_df["signal_ret"]).cumprod() - 1
 
             fig = go.Figure()
             fig.add_trace(go.Scatter(
-                x=cum_signal.index,
-                y=cum_signal.values * 100,
-                mode="lines",
-                name="Model Signal",
+                x=cum_signal.index, y=cum_signal.values * 100,
+                mode="lines", name="Model Signal",
                 line=dict(color="#0ea5e9", width=2.5),
             ))
 
             if bench_rets is not None and len(bench_rets) >= 2:
                 cum_bench = (1 + bench_rets).cumprod() - 1
                 fig.add_trace(go.Scatter(
-                    x=cum_bench.index,
-                    y=cum_bench.values * 100,
-                    mode="lines",
-                    name=bench_choice,
+                    x=cum_bench.index, y=cum_bench.values * 100,
+                    mode="lines", name=bench_choice,
                     line=dict(color=ETF_COLORS.get(bench_choice, "#6366f1"),
                               width=1.8, dash="dot"),
                 ))
 
             fig.update_layout(
-                height=440,
-                template="plotly_dark",
-                paper_bgcolor="#0f172a",
-                plot_bgcolor="#0a0e1a",
+                height=440, template="plotly_dark",
+                paper_bgcolor="#0f172a", plot_bgcolor="#0a0e1a",
                 title="Cumulative Return — OOS Period (%)",
                 xaxis=dict(gridcolor="#1e293b", title="Date"),
                 yaxis=dict(gridcolor="#1e293b", title="Cumulative Return (%)"),
@@ -427,23 +750,19 @@ with tab1:
             fig.add_hline(y=0, line_color="#475569", line_dash="dot")
             st.plotly_chart(fig, use_container_width=True)
 
-            # Summary stats under chart
-            total_ret   = float(cum_signal.iloc[-1]) * 100
-            n_days      = len(signal_df)
-            ann_ret     = ((1 + total_ret / 100) ** (252 / n_days) - 1) * 100 if n_days > 0 else 0
-            daily_std   = float(signal_df["signal_ret"].std()) * np.sqrt(252) * 100
-            sharpe      = ann_ret / daily_std if daily_std > 0 else 0
+            total_ret = float(cum_signal.iloc[-1]) * 100
+            n_days    = len(signal_df)
+            ann_ret   = ((1 + total_ret / 100) ** (252 / n_days) - 1) * 100 if n_days > 0 else 0
+            daily_std = float(signal_df["signal_ret"].std()) * np.sqrt(252) * 100
+            sharpe    = ann_ret / daily_std if daily_std > 0 else 0
 
             sc1, sc2, sc3, sc4 = st.columns(4)
             sc1.metric("Total OOS Return", f"{total_ret:+.2f}%")
             sc2.metric("Ann. Return (est.)", f"{ann_ret:+.2f}%")
             sc3.metric("Ann. Volatility", f"{daily_std:.2f}%")
             sc4.metric("Sharpe (est.)", f"{sharpe:.2f}")
-
         else:
-            st.info("Not enough OOS data yet to plot. The chart will populate as daily runs accumulate.")
-            st.caption("Each weekday run adds one new data point — come back after a few weeks of runs.")
-
+            st.info("Not enough OOS data yet to plot.")
     else:
         st.info("OOS chart will appear once the training pipeline has run and the audit trail is populated.")
 
@@ -454,22 +773,12 @@ with tab1:
 with tab2:
     st.subheader("📊 OOS Model Performance")
 
-    # ── Helper: compute performance stats from audit trail ────────────────────
-    def compute_performance(audit: pd.DataFrame, bench_ret_df: pd.DataFrame,
-                             bench_col: str, rankings_df: pd.DataFrame) -> dict | None:
-        """
-        Compute OOS annualised return, Sharpe, Max DD (P2T), Max DD (daily),
-        Hit Ratio (last 15 days) from the audit trail + actual return data.
-        """
+    def compute_performance(audit, bench_ret_df, bench_col, rankings_df):
         if audit is None or rankings_df is None or bench_ret_df is None:
             return None
-
-        # Get rank-1 signal per date
         r1 = (rankings_df[rankings_df["rank"] == 1][["date", "etf"]]
               .rename(columns={"etf": "top_etf"}))
         r1["date"] = pd.to_datetime(r1["date"])
-
-        # Map to actual returns
         rows = []
         for _, row in r1.iterrows():
             d, etf = row["date"], row["top_etf"]
@@ -477,133 +786,74 @@ with tab2:
                 rows.append({"date": d, "ret": float(ret_df.loc[d, etf]), "etf": etf})
         if not rows:
             return None
-
         df = pd.DataFrame(rows).set_index("date").sort_index()
         df["cum"] = (1 + df["ret"]).cumprod()
-
         n = len(df)
         if n < 2:
             return None
-
-        # Annualised return
         total_ret = float(df["cum"].iloc[-1]) - 1
         ann_ret   = ((1 + total_ret) ** (252 / n) - 1) * 100
-
-        # Sharpe
-        ann_vol = df["ret"].std() * np.sqrt(252) * 100
-        sharpe  = ann_ret / ann_vol if ann_vol > 0 else 0
-
-        # Max drawdown — peak to trough
+        ann_vol   = df["ret"].std() * np.sqrt(252) * 100
+        sharpe    = ann_ret / ann_vol if ann_vol > 0 else 0
         roll_max  = df["cum"].cummax()
         drawdowns = (df["cum"] - roll_max) / roll_max
         max_dd_pt = float(drawdowns.min()) * 100
-
-        # Max drawdown — single worst day
         max_dd_day = float(df["ret"].min()) * 100
-
-        # Hit ratio — last 15 days with actual data
-        last15 = df.tail(15)
+        last15    = df.tail(15)
         hit_ratio = (last15["ret"] > 0).sum() / len(last15) * 100 if len(last15) > 0 else 0
-
-        # Benchmark stats (same dates)
         bench_stats = {}
         if bench_col in bench_ret_df.columns:
             b = bench_ret_df[bench_col].reindex(df.index).dropna()
             if len(b) >= 2:
-                b_cum     = (1 + b).cumprod()
-                b_total   = float(b_cum.iloc[-1]) - 1
-                b_ann     = ((1 + b_total) ** (252 / len(b)) - 1) * 100
-                b_vol     = b.std() * np.sqrt(252) * 100
-                b_sharpe  = b_ann / b_vol if b_vol > 0 else 0
-                b_roll    = b_cum.cummax()
-                b_dd      = ((b_cum - b_roll) / b_roll).min() * 100
-                bench_stats = {
-                    "bench_ann_ret": b_ann,
-                    "bench_sharpe":  b_sharpe,
-                    "bench_max_dd":  float(b_dd),
-                }
-
-        return {
-            "ann_ret": ann_ret, "sharpe": sharpe,
-            "max_dd_pt": max_dd_pt, "max_dd_day": max_dd_day,
-            "hit_ratio": hit_ratio, "n_days": n,
-            **bench_stats,
-        }
+                b_cum    = (1 + b).cumprod()
+                b_total  = float(b_cum.iloc[-1]) - 1
+                b_ann    = ((1 + b_total) ** (252 / len(b)) - 1) * 100
+                b_vol    = b.std() * np.sqrt(252) * 100
+                b_sharpe = b_ann / b_vol if b_vol > 0 else 0
+                b_dd     = ((b_cum - b_cum.cummax()) / b_cum.cummax()).min() * 100
+                bench_stats = {"bench_ann_ret": b_ann, "bench_sharpe": b_sharpe,
+                               "bench_max_dd": float(b_dd)}
+        return {"ann_ret": ann_ret, "sharpe": sharpe, "max_dd_pt": max_dd_pt,
+                "max_dd_day": max_dd_day, "hit_ratio": hit_ratio, "n_days": n,
+                **bench_stats}
 
     bench_col = benchmark if benchmark != "None" else "SPY"
 
     if (audit_df is not None and rankings is not None
             and ret_df is not None and bench_ret is not None):
-
         perf = compute_performance(audit_df, bench_ret, bench_col, rankings)
-
         if perf:
             st.caption(f"OOS period: {perf['n_days']} trading days · Benchmark: {bench_col}")
-
-            # ── Top metric row ────────────────────────────────────────────────
             m1, m2, m3, m4, m5 = st.columns(5)
-
             bench_ann = perf.get("bench_ann_ret")
             bench_sh  = perf.get("bench_sharpe")
             bench_dd  = perf.get("bench_max_dd")
-
-            m1.metric(
-                "Ann. Return (OOS)",
-                f"{perf['ann_ret']:+.2f}%",
-                delta=f"vs {bench_col}: {perf['ann_ret'] - bench_ann:+.2f}%" if bench_ann else None,
-            )
-            m2.metric(
-                "Sharpe Ratio",
-                f"{perf['sharpe']:.2f}",
-                delta=f"vs {bench_col}: {perf['sharpe'] - bench_sh:+.2f}" if bench_sh else None,
-            )
-            m3.metric(
-                "Max DD (Peak→Trough)",
-                f"{perf['max_dd_pt']:.2f}%",
-                delta=f"vs {bench_col}: {perf['max_dd_pt'] - bench_dd:+.2f}%" if bench_dd else None,
-                delta_color="inverse",
-            )
-            m4.metric(
-                "Max DD (Worst Day)",
-                f"{perf['max_dd_day']:.2f}%",
-                delta_color="inverse",
-            )
-            m5.metric(
-                f"Hit Ratio (Last 15d)",
-                f"{perf['hit_ratio']:.1f}%",
-                delta="Above 50% = positive signal" if perf['hit_ratio'] > 50 else "Below 50%",
-                delta_color="normal" if perf['hit_ratio'] > 50 else "inverse",
-            )
-
+            m1.metric("Ann. Return (OOS)", f"{perf['ann_ret']:+.2f}%",
+                      delta=f"vs {bench_col}: {perf['ann_ret'] - bench_ann:+.2f}%" if bench_ann else None)
+            m2.metric("Sharpe Ratio", f"{perf['sharpe']:.2f}",
+                      delta=f"vs {bench_col}: {perf['sharpe'] - bench_sh:+.2f}" if bench_sh else None)
+            m3.metric("Max DD (Peak→Trough)", f"{perf['max_dd_pt']:.2f}%",
+                      delta=f"vs {bench_col}: {perf['max_dd_pt'] - bench_dd:+.2f}%" if bench_dd else None,
+                      delta_color="inverse")
+            m4.metric("Max DD (Worst Day)", f"{perf['max_dd_day']:.2f}%", delta_color="inverse")
+            m5.metric(f"Hit Ratio (Last 15d)", f"{perf['hit_ratio']:.1f}%",
+                      delta="Above 50% = positive signal" if perf['hit_ratio'] > 50 else "Below 50%",
+                      delta_color="normal" if perf['hit_ratio'] > 50 else "inverse")
             st.divider()
-
-            # ── Benchmark comparison table ─────────────────────────────────────
             if bench_ann is not None:
                 comp_data = {
                     "Metric": ["Ann. Return", "Sharpe Ratio", "Max DD (P→T)", "Max DD (Day)", "Hit Ratio (15d)"],
-                    "Model Signal": [
-                        f"{perf['ann_ret']:+.2f}%",
-                        f"{perf['sharpe']:.2f}",
-                        f"{perf['max_dd_pt']:.2f}%",
-                        f"{perf['max_dd_day']:.2f}%",
-                        f"{perf['hit_ratio']:.1f}%",
-                    ],
-                    bench_col: [
-                        f"{bench_ann:+.2f}%",
-                        f"{bench_sh:.2f}",
-                        f"{bench_dd:.2f}%",
-                        "—",
-                        "—",
-                    ],
+                    "Model Signal": [f"{perf['ann_ret']:+.2f}%", f"{perf['sharpe']:.2f}",
+                                     f"{perf['max_dd_pt']:.2f}%", f"{perf['max_dd_day']:.2f}%",
+                                     f"{perf['hit_ratio']:.1f}%"],
+                    bench_col: [f"{bench_ann:+.2f}%", f"{bench_sh:.2f}",
+                                f"{bench_dd:.2f}%", "—", "—"],
                 }
                 st.dataframe(pd.DataFrame(comp_data), use_container_width=True, hide_index=True)
-
         else:
-            st.info("Performance stats will populate once OOS actual returns are available (from T+1 backfill).")
-
+            st.info("Performance stats will populate once OOS actual returns are available.")
     else:
-        st.info("No performance data yet. Run the training pipeline for at least 2 days to see OOS stats.")
-        st.caption("The pipeline backfills actual returns the following trading day, enabling these calculations.")
+        st.info("No performance data yet. Run the training pipeline for at least 2 days.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -620,30 +870,23 @@ with tab3:
 
     if metrics_df is not None and len(metrics_df) > 0:
         latest = metrics_df.sort_values("run_date").groupby("etf").last().reset_index()
-
         fig_h = go.Figure()
         for _, row in latest.iterrows():
             color = "#0ea5e9" if row["hurst_H"] > HURST_THRESH else "#f59e0b"
-            fig_h.add_trace(go.Bar(
-                x=[row["etf"]], y=[row["hurst_H"]],
-                name=row["etf"], marker_color=color,
-                text=f"H={row['hurst_H']:.3f}", textposition="outside",
-            ))
-
+            fig_h.add_trace(go.Bar(x=[row["etf"]], y=[row["hurst_H"]],
+                                   name=row["etf"], marker_color=color,
+                                   text=f"H={row['hurst_H']:.3f}", textposition="outside"))
         fig_h.add_hline(y=HURST_THRESH, line_dash="dash", line_color="#ef4444",
                         annotation_text=f"Long-memory threshold (H={HURST_THRESH})",
                         annotation_position="top right")
         fig_h.add_hline(y=0.5, line_dash="dot", line_color="#64748b",
                         annotation_text="Random walk (H=0.5)")
-        fig_h.update_layout(
-            height=380, template="plotly_dark",
-            paper_bgcolor="#0f172a", plot_bgcolor="#0a0e1a",
-            title="Hurst Exponent by ETF (latest training run)",
-            yaxis=dict(range=[0.3, 0.75], gridcolor="#1e293b", title="H"),
-            showlegend=False, margin=dict(l=0, r=0, t=40, b=0),
-        )
+        fig_h.update_layout(height=380, template="plotly_dark",
+                            paper_bgcolor="#0f172a", plot_bgcolor="#0a0e1a",
+                            title="Hurst Exponent by ETF (latest training run)",
+                            yaxis=dict(range=[0.3, 0.75], gridcolor="#1e293b", title="H"),
+                            showlegend=False, margin=dict(l=0, r=0, t=40, b=0))
         st.plotly_chart(fig_h, use_container_width=True)
-
         hurst_tbl = latest[["etf", "hurst_H", "memory_type", "model_used"]].copy()
         hurst_tbl.columns = ["ETF", "Hurst H", "Memory Type", "Model Used"]
         st.dataframe(hurst_tbl, use_container_width=True, hide_index=True)
@@ -653,18 +896,13 @@ with tab3:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — AUDIT TRAIL
-# One row per day. Top pick ETF only. Actual return looked up directly
-# from ret_df for that ETF on that date. N/A only for today.
 # ══════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.subheader("📋 Audit Trail — Last 15 Trading Days")
     st.caption("One row per day · Top pick ETF · Actual return from source data · N/A = today (market not yet closed)")
 
     if rankings is not None and len(rankings) > 0 and ret_df is not None:
-
         today = pd.Timestamp(datetime.now().date())
-
-        # Get rank-1 signal per date — this is the single source of truth
         rank1 = (rankings[rankings["rank"] == 1]
                  [["date", "etf", "predicted_return_pct",
                    "hurst_H", "model_used", "direction_accuracy",
@@ -673,7 +911,6 @@ with tab4:
         rank1["date"] = pd.to_datetime(rank1["date"])
         rank1 = rank1.sort_values("date", ascending=False).head(AUDIT_ROWS)
 
-        # Pre-build audit lookup dict for fallback {(date, etf): actual_ret_pct}
         audit_lookup = {}
         if audit_df is not None:
             af = audit_df.copy()
@@ -686,61 +923,46 @@ with tab4:
         for _, row in rank1.iterrows():
             d   = row["date"]
             etf = row["etf"]
-
-            # Lookup priority:
-            # 1. ret_df (source dataset — most reliable, may lag 1-2 days)
-            # 2. audit_df backfilled actual_ret_pct (train.py fills this T+1)
-            # 3. N/A — today or data genuinely not yet available
             if d >= today:
-                actual_ret = None          # today — market not yet closed
+                actual_ret = None
             elif etf in ret_df.columns and d in ret_df.index:
                 actual_ret = round(float(ret_df.loc[d, etf]) * 100, 4)
             elif (d, etf) in audit_lookup:
                 actual_ret = round(audit_lookup[(d, etf)], 4)
             else:
-                actual_ret = None          # source data not yet updated
-
+                actual_ret = None
             pred = row["predicted_return_pct"]
             result = ("✅" if actual_ret is not None and actual_ret > 0
-                      else ("❌" if actual_ret is not None and actual_ret <= 0
-                            else "⏳"))
-
-            # Direction correct?
+                      else ("❌" if actual_ret is not None and actual_ret <= 0 else "⏳"))
             dir_correct = "—"
             if actual_ret is not None and pd.notna(pred):
                 dir_correct = "✅" if (pred > 0) == (actual_ret > 0) else "❌"
-
             display_rows.append({
-                "Date":          d.strftime("%Y-%m-%d"),
-                "Top Pick":      etf,
-                "Pred Ret%":     f"{pred:+.3f}%" if pd.notna(pred) else "—",
-                "Actual Ret%":   f"{actual_ret:+.3f}%" if actual_ret is not None else "N/A",
-                "Return":        result,
-                "Direction":     dir_correct,
-                "Hurst H":       round(row["hurst_H"], 3),
-                "Model":         row["model_used"],
-                "Dir Acc%":      round(row["direction_accuracy"], 1),
+                "Date":        d.strftime("%Y-%m-%d"),
+                "Top Pick":    etf,
+                "Pred Ret%":   f"{pred:+.3f}%" if pd.notna(pred) else "—",
+                "Actual Ret%": f"{actual_ret:+.3f}%" if actual_ret is not None else "N/A",
+                "Return":      result,
+                "Direction":   dir_correct,
+                "Hurst H":     round(row["hurst_H"], 3),
+                "Model":       row["model_used"],
+                "Dir Acc%":    round(row["direction_accuracy"], 1),
             })
 
         display_df = pd.DataFrame(display_rows)
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Date":        st.column_config.TextColumn("Date"),
-                "Top Pick":    st.column_config.TextColumn("Top Pick"),
-                "Pred Ret%":   st.column_config.TextColumn("Pred Ret%"),
-                "Actual Ret%": st.column_config.TextColumn("Actual Ret%"),
-                "Return":      st.column_config.TextColumn("Return", width="small"),
-                "Direction":   st.column_config.TextColumn("Dir OK?", width="small"),
-                "Hurst H":     st.column_config.NumberColumn("Hurst H", format="%.3f"),
-                "Model":       st.column_config.TextColumn("Model"),
-                "Dir Acc%":    st.column_config.NumberColumn("OOS Acc%", format="%.1f"),
-            },
-        )
+        st.dataframe(display_df, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Date":        st.column_config.TextColumn("Date"),
+                         "Top Pick":    st.column_config.TextColumn("Top Pick"),
+                         "Pred Ret%":   st.column_config.TextColumn("Pred Ret%"),
+                         "Actual Ret%": st.column_config.TextColumn("Actual Ret%"),
+                         "Return":      st.column_config.TextColumn("Return", width="small"),
+                         "Direction":   st.column_config.TextColumn("Dir OK?", width="small"),
+                         "Hurst H":     st.column_config.NumberColumn("Hurst H", format="%.3f"),
+                         "Model":       st.column_config.TextColumn("Model"),
+                         "Dir Acc%":    st.column_config.NumberColumn("OOS Acc%", format="%.1f"),
+                     })
 
-        # Summary for rows where actual is known
         known = [r for r in display_rows if r["Actual Ret%"] != "N/A"]
         if known:
             wins    = sum(1 for r in known if float(r["Actual Ret%"].replace("%", "")) > 0)
@@ -748,14 +970,11 @@ with tab4:
             avg_ret = np.mean([float(r["Actual Ret%"].replace("%", "")) for r in known])
             st.divider()
             wc1, wc2, wc3 = st.columns(3)
-            wc1.metric("Hit Ratio", f"{wins/total*100:.1f}%",
-                       help="% of days where top pick had positive actual return")
+            wc1.metric("Hit Ratio", f"{wins/total*100:.1f}%")
             wc2.metric("Days Evaluated", total)
             wc3.metric("Avg Actual Return", f"{avg_ret:+.3f}%")
-
     else:
         st.info("Audit trail will populate after the first training run.")
-        st.caption("Actual returns are looked up directly from the source dataset — no backfill needed.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -791,6 +1010,18 @@ with tab5:
     ### 🌊 Hurst Decision Rule
     - **H > 0.52** → Use ARMA-RNN-LSTM hybrid
     - **H ≈ 0.50** → Use RNN only (hybrid adds noise on random-walk series)
+
+    ---
+
+    ### 🔁 Consensus Sweep
+    The **Consensus Sweep** tab trains all 17 training-start year windows (2008–2024)
+    in parallel and scores conviction using:
+    - **40%** vote share — how many windows agree on the same top ETF
+    - **35%** average predicted return across windows
+    - **25%** average Hurst H — strength of trend-persistence signal
+
+    Results are saved to HuggingFace with a UTC date stamp. Old stamped files are
+    cleaned up automatically — only the 2 most recent runs are retained.
 
     ---
 
