@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from huggingface_hub import hf_hub_download
 
 warnings.filterwarnings("ignore")
@@ -47,13 +47,29 @@ ETF_COLORS = {
 CONVICTION_W = {"votes": 0.35, "dir_acc": 0.40, "hurst": 0.25}
 
 # ── Shared Plotly layout helper ────────────────────────────────────────────────
-# White background for all charts
 CHART_LAYOUT = dict(
     template="plotly_white",
     paper_bgcolor="#ffffff",
     plot_bgcolor="#f8fafc",
     font=dict(color="#1e293b"),
 )
+
+
+# ── Helper: next trading day from a given date ─────────────────────────────────
+def next_trading_day(from_date: pd.Timestamp) -> pd.Timestamp:
+    """Return the next weekday (Mon–Fri) after from_date."""
+    d = from_date + timedelta(days=1)
+    while d.weekday() >= 5:   # 5=Sat, 6=Sun
+        d += timedelta(days=1)
+    return d
+
+
+def last_trading_day_on_or_before(ref: pd.Timestamp) -> pd.Timestamp:
+    """Return ref if it's a weekday, otherwise roll back to Friday."""
+    d = ref
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -180,7 +196,7 @@ else:
     c3.warning("⚠️ No rankings yet")
 
 if metrics_df is not None:
-    c4.success(f"✅ Metrics loaded ({len(metrics_df):,} runs)")
+    c4.success(f"✅ Metrics loaded ({len(metrics_df):,} rows)")
 else:
     c4.info("ℹ️ No metrics yet")
 
@@ -261,7 +277,8 @@ live_results = st.session_state.get("live_results", [])
 
 if live_ran and live_results:
     signal_source   = "🚀 Live Inference (in-browser)"
-    signal_date_str = datetime.now().strftime("%A %b %d, %Y")
+    _now = pd.Timestamp(datetime.now().date())
+    signal_date_str = next_trading_day(_now).strftime("%A %b %d, %Y")
     latest_rankings = pd.DataFrame([
         {
             "rank":                 i + 1,
@@ -280,12 +297,8 @@ elif rankings is not None and len(rankings) > 0:
     signal_source   = "📡 Last Scheduled Run (GitHub Actions)"
     latest_rankings = rankings[rankings["date"] == rankings["date"].max()].sort_values("rank")
     if len(latest_rankings) > 0:
-        run_date = latest_rankings.iloc[0]["date"]
-        from datetime import timedelta
-        target = run_date + timedelta(days=1)
-        while target.weekday() >= 5:
-            target += timedelta(days=1)
-        signal_date_str = target.strftime("%A %b %d, %Y")
+        run_date = pd.Timestamp(latest_rankings.iloc[0]["date"])
+        signal_date_str = next_trading_day(run_date).strftime("%A %b %d, %Y")
     else:
         signal_date_str = ""
 else:
@@ -433,7 +446,7 @@ with tab_consensus:
         top_etf    = top_row["etf"]
         conv       = float(top_row["conviction"])
         avg_dir    = float(top_row["avg_dir_acc"])
-        avg_ret    = float(top_row["avg_pred_ret"])   # display only
+        avg_ret    = float(top_row["avg_pred_ret"])
         votes      = int(top_row["votes"])
         vote_share = float(top_row["vote_share"])
         avg_H      = float(top_row["avg_H"])
@@ -443,13 +456,19 @@ with tab_consensus:
         bdr_color = "#bbf7d0"
         etf_color = ETF_COLORS.get(top_etf, "#111827")
 
+        # ── FIX: compute next trading day from run_ts, not datetime.now() ──
+        _run_date = (pd.Timestamp(run_ts[:10])
+                     if run_ts and run_ts != "unknown"
+                     else pd.Timestamp(datetime.now().date()))
+        _next_td = next_trading_day(_run_date)
+        consensus_signal_date = _next_td.strftime("%A %b %d, %Y")
+
         # ── Consensus hero banner ──────────────────────────────────────────
-        signal_date_str = datetime.now().strftime("%A %b %d, %Y")
         st.markdown(f"""
         <div style="background:{bg_color}; border:2px solid {bdr_color};
                     border-radius:14px; padding:26px 32px; margin-bottom:20px;">
             <div style="font-size:11px; letter-spacing:3px; color:#6b7280; margin-bottom:8px;">
-                CONSENSUS SIGNAL — {signal_date_str}
+                CONSENSUS SIGNAL — {consensus_signal_date}
                 <span style="float:right; font-size:10px; color:#9ca3af;">
                     CONVICTION SWEEP · 2008–2024
                 </span>
@@ -528,7 +547,7 @@ with tab_consensus:
 
         st.divider()
 
-        # ── Year-by-year vote heatmap (WHITE background) ───────────────────
+        # ── Year-by-year vote heatmap ──────────────────────────────────────
         if year_tops:
             st.subheader("🗳️ Year-by-Year Top Picks")
             st.caption("Which ETF ranked #1 for each training-start year window")
@@ -572,7 +591,7 @@ with tab_consensus:
             )
             st.plotly_chart(fig_heat, use_container_width=True)
 
-        # ── Conviction score breakdown bar chart (WHITE background) ────────
+        # ── Conviction score breakdown bar chart ───────────────────────────
         st.subheader("📐 Conviction Score Decomposition")
         st.caption(
             "How vote share, OOS directional accuracy and Hurst H "
@@ -873,7 +892,13 @@ with tab4:
     st.caption("One row per day · Top pick ETF · Actual return from source data · N/A = today")
 
     if rankings is not None and len(rankings) > 0 and ret_df is not None:
-        today = pd.Timestamp(datetime.now().date())
+
+        # ── FIX: compute last trading day whose return is available ────────
+        # Returns are available for all completed trading days up to and
+        # including yesterday (or Friday if today is weekend).
+        _today = pd.Timestamp(datetime.now().date())
+        _last_td = last_trading_day_on_or_before(_today - timedelta(days=1))
+
         rank1 = (rankings[rankings["rank"] == 1]
                  [["date", "etf", "predicted_return_pct",
                    "hurst_H", "model_used", "direction_accuracy",
@@ -894,7 +919,9 @@ with tab4:
         for _, row in rank1.iterrows():
             d   = row["date"]
             etf = row["etf"]
-            if d >= today:
+
+            # ── FIX: only mark N/A if date is strictly after last trading day
+            if d > _last_td:
                 actual_ret = None
             elif etf in ret_df.columns and d in ret_df.index:
                 actual_ret = round(float(ret_df.loc[d, etf]) * 100, 4)
@@ -902,6 +929,7 @@ with tab4:
                 actual_ret = round(audit_lookup[(d, etf)], 4)
             else:
                 actual_ret = None
+
             pred = row["predicted_return_pct"]
             result = ("✅" if actual_ret is not None and actual_ret > 0
                       else ("❌" if actual_ret is not None and actual_ret <= 0 else "⏳"))
@@ -914,23 +942,23 @@ with tab4:
                 "Pred Ret%":   f"{pred:+.3f}%" if pd.notna(pred) else "—",
                 "Actual Ret%": f"{actual_ret:+.3f}%" if actual_ret is not None else "N/A",
                 "Return":      result,
-                "Direction":   dir_correct,
+                "Dir OK?":     dir_correct,
                 "Hurst H":     round(row["hurst_H"], 3),
                 "Model":       row["model_used"],
-                "Dir Acc%":    round(row["direction_accuracy"], 1),
+                "OOS Acc%":    round(row["direction_accuracy"], 1),
             })
 
         st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True,
                      column_config={
-                         "Date":        st.column_config.TextColumn("Date"),
-                         "Top Pick":    st.column_config.TextColumn("Top Pick"),
-                         "Pred Ret%":   st.column_config.TextColumn("Pred Ret%"),
-                         "Actual Ret%": st.column_config.TextColumn("Actual Ret%"),
-                         "Return":      st.column_config.TextColumn("Return", width="small"),
-                         "Direction":   st.column_config.TextColumn("Dir OK?", width="small"),
-                         "Hurst H":     st.column_config.NumberColumn("Hurst H", format="%.3f"),
-                         "Model":       st.column_config.TextColumn("Model"),
-                         "Dir Acc%":    st.column_config.NumberColumn("OOS Acc%", format="%.1f"),
+                         "Date":       st.column_config.TextColumn("Date"),
+                         "Top Pick":   st.column_config.TextColumn("Top Pick"),
+                         "Pred Ret%":  st.column_config.TextColumn("Pred Ret%"),
+                         "Actual Ret%":st.column_config.TextColumn("Actual Ret%"),
+                         "Return":     st.column_config.TextColumn("Return", width="small"),
+                         "Dir OK?":    st.column_config.TextColumn("Dir OK?", width="small"),
+                         "Hurst H":    st.column_config.NumberColumn("Hurst H", format="%.3f"),
+                         "Model":      st.column_config.TextColumn("Model"),
+                         "OOS Acc%":   st.column_config.NumberColumn("OOS Acc%", format="%.1f"),
                      })
 
         known = [r for r in display_rows if r["Actual Ret%"] != "N/A"]
