@@ -23,7 +23,7 @@ import argparse
 import io
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -60,16 +60,10 @@ np.random.seed(SEED)
 DEFAULT_YEARS = list(range(2008, 2025))   # 2008 → 2024 inclusive
 CONSENSUS_DIR = "consensus"
 
-# Revised conviction weights:
-#   dir_acc (0.40) replaces raw predicted return — it measures how well
-#   predictions matched actual OOS returns in direction, making it a
-#   genuine ground-truth accuracy signal.
-#   vote_share (0.35) uses predicted return only to determine the #1 pick
-#   per window (still needed as a forward signal for the next trading day).
 CONVICTION_W = {
-    "votes":   0.35,   # vote share: how many windows rank this ETF #1
-    "dir_acc": 0.40,   # OOS directional accuracy: predicted vs actual sync
-    "hurst":   0.25,   # Hurst H: trend-persistence signal strength
+    "votes":   0.35,
+    "dir_acc": 0.40,
+    "hurst":   0.25,
 }
 
 ETF_LABELS = {
@@ -82,6 +76,15 @@ ETF_LABELS = {
 }
 
 
+# ── Helper: next trading day ───────────────────────────────────────────────────
+def _next_trading_day(from_date: pd.Timestamp) -> pd.Timestamp:
+    """Return the next weekday (Mon–Fri) after from_date."""
+    d = from_date + timedelta(days=1)
+    while d.weekday() >= 5:   # 5=Sat, 6=Sun
+        d += timedelta(days=1)
+    return d
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Per-year inference
 # ══════════════════════════════════════════════════════════════════════════════
@@ -90,10 +93,6 @@ def _infer_one_year(year: int, data: dict, device: torch.device) -> dict | None:
     """
     Run full pipeline for a single training-start year.
     Returns {etf: result_dict} or None on failure.
-
-    dir_acc comes from trainer._compute_metrics() — it is the fraction of
-    held-out test-period days where the predicted return sign matched the
-    actual return sign. This is the ground-truth sync measure for conviction.
     """
     try:
         cutoff  = pd.Timestamp(f"{year}-01-01")
@@ -104,7 +103,6 @@ def _infer_one_year(year: int, data: dict, device: torch.device) -> dict | None:
             logger.warning(f"[{year}] Insufficient data ({len(price_f)} rows) — skipping")
             return None
 
-        # Slice all data keys to cutoff
         data_y = {
             k: v[v.index >= cutoff] if isinstance(v, pd.DataFrame) else v
             for k, v in data.items()
@@ -149,11 +147,8 @@ def _infer_one_year(year: int, data: dict, device: torch.device) -> dict | None:
                 pred_logret   = float(res["test_preds"][-1]) if len(res["test_preds"]) else 0.0
                 current_price = float(price_f[etf].iloc[-1])
 
-                # dir_acc = OOS directional accuracy from trainer._compute_metrics()
-                # = % of test-period predictions with correct sign vs actual returns
                 dir_acc = res["metrics"].get(
                     "hybrid_dir_acc", res["metrics"].get("rnn_dir_acc", 50.0))
-
                 mae  = res["metrics"].get("hybrid_mae",  res["metrics"].get("rnn_mae",  0.0))
                 rmse = res["metrics"].get("hybrid_rmse", res["metrics"].get("rnn_rmse", 0.0))
 
@@ -189,23 +184,22 @@ def _infer_one_year(year: int, data: dict, device: torch.device) -> dict | None:
 # Conviction scorer
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _compute_conviction(all_rows: list[dict], years_run: int) -> pd.DataFrame:
+def _compute_conviction(all_rows: list[dict], years_run: int,
+                        run_ts: str, signal_date: str) -> pd.DataFrame:
     """
-    Score ETFs using revised weighted conviction formula.
+    Score ETFs using weighted conviction formula (v2).
 
     Score = 0.35 × vote_share
            + 0.40 × norm_avg_dir_acc
            + 0.25 × norm_avg_H
 
-    avg_pred_ret is retained in output for display and reference but is NOT
-    used in the conviction formula. The scoring is driven by how well each
-    ETF's model actually predicted direction over the OOS test periods.
+    avg_pred_ret is stored for display only — not used in scoring.
+    signal_date is the next trading day this sweep is predicting for.
     """
     df = pd.DataFrame(all_rows)
     if df.empty:
         return pd.DataFrame()
 
-    # Top ETF per year by predicted return (forward signal for next day)
     top_per_year = (
         df.sort_values("pred_ret_pct", ascending=False)
           .groupby("year").first()
@@ -217,9 +211,9 @@ def _compute_conviction(all_rows: list[dict], years_run: int) -> pd.DataFrame:
     agg = (
         df.groupby("etf")
           .agg(
-              avg_pred_ret=("pred_ret_pct", "mean"),   # display only
+              avg_pred_ret=("pred_ret_pct", "mean"),
               avg_H=("H",            "mean"),
-              avg_dir_acc=("dir_acc", "mean"),          # primary conviction driver
+              avg_dir_acc=("dir_acc", "mean"),
               avg_mae=("mae",         "mean"),
               avg_rmse=("rmse",       "mean"),
               year_count=("year",     "count"),
@@ -236,6 +230,8 @@ def _compute_conviction(all_rows: list[dict], years_run: int) -> pd.DataFrame:
 
     agg["norm_dir_acc"] = minmax(agg["avg_dir_acc"])
     agg["norm_H"]       = minmax(agg["avg_H"])
+    # kept for backwards compat with app.py conviction decomposition chart
+    agg["norm_ret"]     = minmax(agg["avg_pred_ret"])
 
     agg["conviction"] = (
           CONVICTION_W["votes"]   * agg["vote_share"]
@@ -243,10 +239,11 @@ def _compute_conviction(all_rows: list[dict], years_run: int) -> pd.DataFrame:
         + CONVICTION_W["hurst"]   * agg["norm_H"]
     )
 
-    agg["rank"]      = agg["conviction"].rank(ascending=False, method="first").astype(int)
-    agg["label"]     = agg["etf"].map(ETF_LABELS).fillna("")
-    agg["years_run"] = years_run
-    agg["run_ts"]    = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    agg["rank"]        = agg["conviction"].rank(ascending=False, method="first").astype(int)
+    agg["label"]       = agg["etf"].map(ETF_LABELS).fillna("")
+    agg["years_run"]   = years_run
+    agg["run_ts"]      = run_ts        # when the sweep ran (UTC ISO)
+    agg["signal_date"] = signal_date   # next trading day being predicted for
 
     return agg.sort_values("rank").reset_index(drop=True)
 
@@ -300,10 +297,11 @@ def _save_to_hf(conviction_df: pd.DataFrame, flat_df: pd.DataFrame,
         def _clean(prefix, keep_this):
             candidates = [
                 f for f in all_files
-                if f.startswith(f"{CONSENSUS_DIR}/{prefix}_2")  # date-stamped only
+                if f.startswith(f"{CONSENSUS_DIR}/{prefix}_2")
             ]
-            to_delete = [f for f in candidates if f != keep_this]
-            for old in to_delete:
+            for old in candidates:
+                if old == keep_this:
+                    continue
                 try:
                     api.delete_file(
                         path_in_repo=old,
@@ -336,9 +334,15 @@ def main():
     args = parser.parse_args()
 
     run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Compute the next trading day this sweep is predicting for
+    _today       = pd.Timestamp(datetime.now(timezone.utc).date())
+    signal_date  = _next_trading_day(_today).strftime("%Y-%m-%d")
+
     logger.info("=" * 70)
     logger.info("P2-ETF Consensus Sweep (v2 — dir_acc conviction)")
-    logger.info(f"Run: {run_ts}")
+    logger.info(f"Run:         {run_ts}")
+    logger.info(f"Signal for:  {signal_date}  (next trading day)")
     logger.info(f"Years: {args.years[0]}–{args.years[-1]} ({len(args.years)} windows)")
     logger.info(f"Workers: {args.workers}")
     logger.info(
@@ -357,7 +361,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
-    # ── Load full history once — shared across all threads ────────────────────
     logger.info("\n── Loading data from HuggingFace ──")
     data = load_all_data(token)
     logger.info(
@@ -365,7 +368,6 @@ def main():
         f"({data['price'].index[0].date()} → {data['price'].index[-1].date()})"
     )
 
-    # ── Parallel sweep ────────────────────────────────────────────────────────
     logger.info(f"\n── Running {len(args.years)} year windows in parallel ──")
     all_flat  = []
     year_tops = {}
@@ -405,12 +407,13 @@ def main():
         logger.error("No results produced — aborting.")
         sys.exit(1)
 
-    # ── Conviction scoring ────────────────────────────────────────────────────
     logger.info("\n── Computing conviction scores ──")
-    conviction_df = _compute_conviction(all_flat, years_run)
-    flat_df       = pd.DataFrame(all_flat)
+    conviction_df = _compute_conviction(all_flat, years_run, run_ts, signal_date)
+
+    flat_df              = pd.DataFrame(all_flat)
     flat_df["run_ts"]    = run_ts
     flat_df["years_run"] = years_run
+    flat_df["signal_date"] = signal_date
 
     # Log final ranking
     logger.info("\n📊 CONSENSUS RANKING:")
@@ -436,15 +439,15 @@ def main():
         f"\n★ CONSENSUS TOP PICK: {top_etf} "
         f"(conviction={top_conv:.3f}  "
         f"dir_acc={top_acc:.1f}%  "
-        f"votes={int(conviction_df.iloc[0]['votes'])}/{years_run})"
+        f"votes={int(conviction_df.iloc[0]['votes'])}/{years_run}  "
+        f"signal_for={signal_date})"
     )
 
-    # ── Save to HuggingFace ───────────────────────────────────────────────────
     logger.info("\n── Saving to HuggingFace ──")
     _save_to_hf(conviction_df, flat_df, run_ts, token)
 
     logger.info("\n" + "=" * 70)
-    logger.info(f"✅ Consensus sweep complete — top pick: {top_etf}")
+    logger.info(f"✅ Consensus sweep complete — top pick: {top_etf} for {signal_date}")
     logger.info("=" * 70)
 
 
