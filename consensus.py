@@ -2,8 +2,8 @@
 # Consensus Sweep — runs inference across all training-start years in parallel
 # and combines signals using a weighted conviction score.
 #
-# Conviction formula (equal thirds):
-#   score = (vote_share × 0.40) + (norm_avg_return × 0.35) + (norm_avg_H × 0.25)
+# Conviction formula (v2):
+#   score = (vote_share × 0.35) + (norm_dir_acc × 0.40) + (norm_avg_H × 0.25)
 #
 # Usage (called from app.py):
 #   from consensus import run_consensus_sweep, save_consensus_results, load_consensus_results
@@ -14,7 +14,7 @@ import logging
 import warnings
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 warnings.filterwarnings("ignore")
@@ -37,6 +37,15 @@ ETF_LABELS = {
 }
 
 
+# ── Helper ─────────────────────────────────────────────────────────────────────
+def _next_trading_day(from_date: pd.Timestamp) -> pd.Timestamp:
+    """Return the next weekday (Mon–Fri) after from_date."""
+    d = from_date + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
 # ── Per-year inference (runs in thread) ───────────────────────────────────────
 
 def _infer_one_year(year: int, price_df: pd.DataFrame,
@@ -56,7 +65,7 @@ def _infer_one_year(year: int, price_df: pd.DataFrame,
         pf      = price_df[price_df.index >= cutoff]
         rf      = ret_df[ret_df.index >= cutoff] if ret_df is not None else None
 
-        if len(pf) < 200:          # not enough data for this year
+        if len(pf) < 200:
             return None
 
         device  = torch.device("cpu")
@@ -127,15 +136,17 @@ def _compute_conviction(all_year_results: list[dict]) -> pd.DataFrame:
     Given a flat list of {year, etf, pred_ret_pct, H, dir_acc, ...} dicts,
     compute conviction score per ETF.
 
-    Score = 0.40 × vote_share
-           + 0.35 × norm_avg_return    (min-max normalised across ETFs)
-           + 0.25 × norm_avg_H         (min-max normalised)
+    Score (v2) = 0.35 × vote_share
+               + 0.40 × norm_dir_acc   (min-max normalised across ETFs)
+               + 0.25 × norm_avg_H     (min-max normalised)
+
+    avg_pred_ret is stored for display only — not used in scoring.
     """
     df = pd.DataFrame(all_year_results)
     if df.empty:
         return pd.DataFrame()
 
-    # Which ETF ranked #1 per year?
+    # Which ETF ranked #1 per year by predicted return?
     top_per_year = (df.sort_values("pred_ret_pct", ascending=False)
                       .groupby("year")
                       .first()
@@ -154,24 +165,26 @@ def _compute_conviction(all_year_results: list[dict]) -> pd.DataFrame:
     agg["votes"]      = agg["etf"].map(vote_counts).fillna(0).astype(int)
     agg["vote_share"] = agg["votes"] / total_years
 
-    # Min-max normalise return and H (handle edge case: all equal)
+    # Min-max normalise dir_acc and H (handle edge case: all equal)
     def minmax(s):
         r = s.max() - s.min()
         return (s - s.min()) / r if r > 1e-9 else pd.Series([0.5] * len(s), index=s.index)
 
-    agg["norm_ret"] = minmax(agg["avg_pred_ret"])
-    agg["norm_H"]   = minmax(agg["avg_H"])
+    agg["norm_dir_acc"] = minmax(agg["avg_dir_acc"])
+    agg["norm_H"]       = minmax(agg["avg_H"])
+    # Keep norm_ret for backwards compat but don't use in score
+    agg["norm_ret"]     = minmax(agg["avg_pred_ret"])
 
-    agg["conviction"] = (0.40 * agg["vote_share"]
-                       + 0.35 * agg["norm_ret"]
+    # v2 conviction formula: votes 35%, dir_acc 40%, H 25%
+    agg["conviction"] = (0.35 * agg["vote_share"]
+                       + 0.40 * agg["norm_dir_acc"]
                        + 0.25 * agg["norm_H"])
 
     agg["rank"] = agg["conviction"].rank(ascending=False, method="first").astype(int)
     agg = agg.sort_values("rank").reset_index(drop=True)
 
-    # Top-pick label & year detail
-    agg["label"]     = agg["etf"].map(ETF_LABELS).fillna("")
-    agg["run_date"]  = pd.Timestamp(datetime.now(timezone.utc).date())
+    agg["label"]    = agg["etf"].map(ETF_LABELS).fillna("")
+    agg["run_date"] = pd.Timestamp(datetime.now(timezone.utc).date())
 
     return agg
 
@@ -186,13 +199,6 @@ def run_consensus_sweep(price_df: pd.DataFrame,
     """
     Run all-years consensus sweep in parallel threads.
 
-    Parameters
-    ----------
-    price_df, ret_df  : full history price / returns DataFrames
-    years             : list of training-start years (default CONSENSUS_YEARS)
-    max_workers       : thread pool size
-    progress_callback : optional callable(pct_done, status_text)
-
     Returns
     -------
     dict with keys:
@@ -201,7 +207,8 @@ def run_consensus_sweep(price_df: pd.DataFrame,
         "year_tops"      : dict           {year: top_etf}
         "years_run"      : int
         "years_failed"   : int
-        "run_ts"         : str (ISO timestamp)
+        "run_ts"         : str (ISO UTC timestamp of when sweep ran)
+        "signal_date"    : str (next trading day — the date being predicted for)
     """
     if years is None:
         years = CONSENSUS_YEARS
@@ -244,10 +251,16 @@ def run_consensus_sweep(price_df: pd.DataFrame,
 
     conviction_df = _compute_conviction(all_flat)
 
+    # run_ts = when the sweep actually ran (UTC)
     run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # signal_date = next trading day after today (what we're predicting for)
+    _today = pd.Timestamp(datetime.now(timezone.utc).date())
+    signal_date = _next_trading_day(_today).strftime("%Y-%m-%d")
+
     if progress_callback:
         top_etf = conviction_df.iloc[0]["etf"] if len(conviction_df) > 0 else "—"
-        progress_callback(1.0, f"✅ Sweep complete — consensus pick: **{top_etf}**")
+        progress_callback(1.0, f"✅ Sweep complete — consensus pick: **{top_etf}** for {signal_date}")
 
     return {
         "conviction":   conviction_df,
@@ -256,6 +269,7 @@ def run_consensus_sweep(price_df: pd.DataFrame,
         "years_run":    done - failed,
         "years_failed": failed,
         "run_ts":       run_ts,
+        "signal_date":  signal_date,
     }
 
 
@@ -265,11 +279,6 @@ def save_consensus_results(sweep_result: dict, token: str = None) -> bool:
     """
     Push consensus results to HF results dataset.
     Keeps ONLY the latest run (date-stamped filename + pointer file).
-    Old files with different date stamps are deleted automatically.
-
-    Files written:
-      consensus/consensus_YYYYMMDD_HHMM.parquet   ← stamped archive
-      consensus/consensus_latest.parquet           ← always the latest (overwritten)
     """
     try:
         from huggingface_hub import HfApi
@@ -282,12 +291,13 @@ def save_consensus_results(sweep_result: dict, token: str = None) -> bool:
 
         api = HfApi()
         df  = sweep_result["conviction"].copy()
-        df["run_ts"]    = sweep_result["run_ts"]
-        df["years_run"] = sweep_result["years_run"]
+        df["run_ts"]     = sweep_result["run_ts"]
+        df["years_run"]  = sweep_result["years_run"]
+        df["signal_date"] = sweep_result.get("signal_date", "")
 
-        # Also save full per-year flat table
         flat_df = pd.DataFrame(sweep_result["all_results"])
-        flat_df["run_ts"] = sweep_result["run_ts"]
+        flat_df["run_ts"]     = sweep_result["run_ts"]
+        flat_df["signal_date"] = sweep_result.get("signal_date", "")
 
         run_ts_clean = sweep_result["run_ts"][:16].replace(":", "").replace("-", "").replace("T", "_")
         stamped_name = f"{CONSENSUS_DIR}/consensus_{run_ts_clean}.parquet"
@@ -305,39 +315,33 @@ def save_consensus_results(sweep_result: dict, token: str = None) -> bool:
                 commit_message=f"[auto] Consensus update — {sweep_result['run_ts']}",
             )
 
-        # Upload stamped + latest pointer
         _upload(df, stamped_name)
         _upload(df, CONSENSUS_FILE)
 
-        # Upload flat per-year table alongside
         flat_stamped = f"{CONSENSUS_DIR}/flat_{run_ts_clean}.parquet"
         _upload(flat_df, flat_stamped)
         _upload(flat_df, f"{CONSENSUS_DIR}/flat_latest.parquet")
 
-        # ── Cleanup old stamped files (keep only latest 2) ────────────────
+        # ── Cleanup old stamped files ──────────────────────────────────────
         try:
             from huggingface_hub import list_repo_files
             all_files = list(list_repo_files(HF_RESULTS_DATASET,
                                              repo_type="dataset", token=token))
-            consensus_files = sorted([
+            to_delete_stamped = sorted([
                 f for f in all_files
-                if f.startswith(f"{CONSENSUS_DIR}/consensus_2")
-                   or f.startswith(f"{CONSENSUS_DIR}/flat_2")
+                if f.startswith(f"{CONSENSUS_DIR}/consensus_2") and f != stamped_name
             ])
-            # Delete all except the 2 most recent of each type
-            to_delete = [f for f in consensus_files if f != stamped_name
-                         and f != flat_stamped]
-            # keep newest 2 stamped, newest 2 flat
-            stamped_old = sorted([f for f in to_delete
-                                   if f.startswith(f"{CONSENSUS_DIR}/consensus_2")])[:-1]
-            flat_old    = sorted([f for f in to_delete
-                                   if f.startswith(f"{CONSENSUS_DIR}/flat_2")])[:-1]
-            for old_file in stamped_old + flat_old:
+            to_delete_flat = sorted([
+                f for f in all_files
+                if f.startswith(f"{CONSENSUS_DIR}/flat_2") and f != flat_stamped
+            ])
+            # Keep only the most recent previous stamped file (i.e. delete all but last 1)
+            for old_file in to_delete_stamped[:-1] + to_delete_flat[:-1]:
                 try:
                     api.delete_file(path_in_repo=old_file,
                                     repo_id=HF_RESULTS_DATASET,
                                     repo_type="dataset", token=token,
-                                    commit_message=f"[auto] Cleanup old consensus — {old_file}")
+                                    commit_message=f"[auto] Cleanup — {old_file}")
                     logger.info(f"Deleted old consensus file: {old_file}")
                 except Exception:
                     pass
