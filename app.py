@@ -456,12 +456,18 @@ with tab_consensus:
         bdr_color = "#bbf7d0"
         etf_color = ETF_COLORS.get(top_etf, "#111827")
 
-        # ── FIX: compute next trading day from run_ts, not datetime.now() ──
-        _run_date = (pd.Timestamp(run_ts[:10])
-                     if run_ts and run_ts != "unknown"
-                     else pd.Timestamp(datetime.now().date()))
-        _next_td = next_trading_day(_run_date)
-        consensus_signal_date = _next_td.strftime("%A %b %d, %Y")
+        # ── FIX: use the stored signal_date from the consensus data ────────────
+        if "signal_date" in conviction_df.columns and not pd.isna(conviction_df["signal_date"].iloc[0]):
+            consensus_signal_date = conviction_df["signal_date"].iloc[0]
+            # Convert from YYYY-MM-DD to "Monday Jan 01, 2025" format
+            consensus_signal_date = pd.to_datetime(consensus_signal_date).strftime("%A %b %d, %Y")
+        else:
+            # Fallback to old logic (using run_ts)
+            _run_date = (pd.Timestamp(run_ts[:10])
+                         if run_ts and run_ts != "unknown"
+                         else pd.Timestamp(datetime.now().date()))
+            _next_td = next_trading_day(_run_date)
+            consensus_signal_date = _next_td.strftime("%A %b %d, %Y")
 
         # ── Consensus hero banner ──────────────────────────────────────────
         st.markdown(f"""
