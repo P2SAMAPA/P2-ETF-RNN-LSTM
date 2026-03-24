@@ -301,13 +301,13 @@ if live_ran and live_results:
         }
         for i, r in enumerate(live_results)
     ])
+
 elif rankings is not None and len(rankings) > 0:
     signal_source   = "📡 Last Scheduled Run (GitHub Actions)"
     latest_rankings = rankings[rankings["date"] == rankings["date"].max()].sort_values("rank")
     if len(latest_rankings) > 0:
-        # Use the date from rankings (last data date) and compute next trading day
-        last_data_date = pd.Timestamp(latest_rankings.iloc[0]["date"])
-        signal_date = next_trading_day(last_data_date)
+        # Use the date from the rankings data directly (it should already be the target trading day)
+        signal_date = pd.Timestamp(latest_rankings.iloc[0]["date"])
         signal_date_str = signal_date.strftime("%A %b %d, %Y")
     else:
         signal_date_str = ""
