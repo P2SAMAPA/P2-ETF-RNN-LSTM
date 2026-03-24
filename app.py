@@ -466,13 +466,11 @@ with tab_consensus:
         bdr_color = "#bbf7d0"
         etf_color = ETF_COLORS.get(top_etf, "#111827")
 
-  
-        # ── Use the run date as the signal date (no next trading day) ──
+        # ── Determine the date to display (use the run timestamp directly) ──
         if run_ts and run_ts != "unknown":
-            base_date = pd.Timestamp(run_ts[:10])
+            consensus_signal_date = pd.Timestamp(run_ts[:10])
         else:
-            base_date = pd.Timestamp(datetime.now().date())
-            consensus_signal_date = base_date
+            consensus_signal_date = pd.Timestamp(datetime.now().date())
         consensus_signal_date_str = consensus_signal_date.strftime("%A %b %d, %Y")
 
         # ── Consensus hero banner ──────────────────────────────────────────
