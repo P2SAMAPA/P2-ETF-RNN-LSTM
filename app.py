@@ -9,6 +9,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from datetime import datetime, timezone, timedelta
 from huggingface_hub import hf_hub_download
+import pandas_market_calendars as mcal
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.WARNING)
@@ -20,6 +21,21 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ── NYSE Calendar helper ───────────────────────────────────────────────────────
+nyse = mcal.get_calendar("NYSE")
+
+def next_trading_day(date: pd.Timestamp) -> pd.Timestamp:
+    """
+    Return the next NYSE trading day after the given date.
+    """
+    schedule = nyse.schedule(start_date=date, end_date=date + pd.Timedelta(days=10))
+    trading_days = schedule.index
+    next_days = trading_days[trading_days > date]
+    if len(next_days) > 0:
+        return next_days[0]
+    # fallback (should not happen for valid dates)
+    return date + pd.Timedelta(days=1)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 HF_RESULTS   = "P2SAMAPA/p2-etf-rnn-lstm-results"
@@ -54,23 +70,13 @@ CHART_LAYOUT = dict(
     font=dict(color="#1e293b"),
 )
 
-
-# ── Helper: next trading day from a given date ─────────────────────────────────
-def next_trading_day(from_date: pd.Timestamp) -> pd.Timestamp:
-    """Return the next weekday (Mon–Fri) after from_date."""
-    d = from_date + timedelta(days=1)
-    while d.weekday() >= 5:   # 5=Sat, 6=Sun
-        d += timedelta(days=1)
-    return d
-
-
+# ── Helper: last trading day (for audit trail) ─────────────────────────────────
 def last_trading_day_on_or_before(ref: pd.Timestamp) -> pd.Timestamp:
     """Return ref if it's a weekday, otherwise roll back to Friday."""
     d = ref
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
-
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -277,8 +283,10 @@ live_results = st.session_state.get("live_results", [])
 
 if live_ran and live_results:
     signal_source   = "🚀 Live Inference (in-browser)"
+    # For live inference, use current date as base
     _now = pd.Timestamp(datetime.now().date())
-    signal_date_str = next_trading_day(_now).strftime("%A %b %d, %Y")
+    signal_date = next_trading_day(_now)
+    signal_date_str = signal_date.strftime("%A %b %d, %Y")
     latest_rankings = pd.DataFrame([
         {
             "rank":                 i + 1,
@@ -297,8 +305,10 @@ elif rankings is not None and len(rankings) > 0:
     signal_source   = "📡 Last Scheduled Run (GitHub Actions)"
     latest_rankings = rankings[rankings["date"] == rankings["date"].max()].sort_values("rank")
     if len(latest_rankings) > 0:
-        run_date = pd.Timestamp(latest_rankings.iloc[0]["date"])
-        signal_date_str = next_trading_day(run_date).strftime("%A %b %d, %Y")
+        # Use the date from rankings (last data date) and compute next trading day
+        last_data_date = pd.Timestamp(latest_rankings.iloc[0]["date"])
+        signal_date = next_trading_day(last_data_date)
+        signal_date_str = signal_date.strftime("%A %b %d, %Y")
     else:
         signal_date_str = ""
 else:
@@ -456,25 +466,23 @@ with tab_consensus:
         bdr_color = "#bbf7d0"
         etf_color = ETF_COLORS.get(top_etf, "#111827")
 
-        # ── FIX: use the stored signal_date from the consensus data ────────────
+        # ── FIX: use the stored signal_date if available, else compute from run_ts ──
         if "signal_date" in conviction_df.columns and not pd.isna(conviction_df["signal_date"].iloc[0]):
-            consensus_signal_date = conviction_df["signal_date"].iloc[0]
-            # Convert from YYYY-MM-DD to "Monday Jan 01, 2025" format
-            consensus_signal_date = pd.to_datetime(consensus_signal_date).strftime("%A %b %d, %Y")
+            # Use the stored date directly
+            consensus_signal_date = pd.Timestamp(conviction_df["signal_date"].iloc[0])
         else:
-            # Fallback to old logic (using run_ts)
-            _run_date = (pd.Timestamp(run_ts[:10])
-                         if run_ts and run_ts != "unknown"
+            # Fallback: base on run timestamp
+            base_date = (pd.Timestamp(run_ts[:10]) if run_ts and run_ts != "unknown"
                          else pd.Timestamp(datetime.now().date()))
-            _next_td = next_trading_day(_run_date)
-            consensus_signal_date = _next_td.strftime("%A %b %d, %Y")
+            consensus_signal_date = next_trading_day(base_date)
+        consensus_signal_date_str = consensus_signal_date.strftime("%A %b %d, %Y")
 
         # ── Consensus hero banner ──────────────────────────────────────────
         st.markdown(f"""
         <div style="background:{bg_color}; border:2px solid {bdr_color};
                     border-radius:14px; padding:26px 32px; margin-bottom:20px;">
             <div style="font-size:11px; letter-spacing:3px; color:#6b7280; margin-bottom:8px;">
-                CONSENSUS SIGNAL — {consensus_signal_date}
+                CONSENSUS SIGNAL — {consensus_signal_date_str}
                 <span style="float:right; font-size:10px; color:#9ca3af;">
                     CONVICTION SWEEP · 2008–2024
                 </span>
@@ -511,7 +519,7 @@ with tab_consensus:
         </div>
         """, unsafe_allow_html=True)
 
-        # ── All ETF conviction cards ───────────────────────────────────────
+        # ── All ETF conviction cards (unchanged) ──────────────────────────────
         st.subheader("📊 Full ETF Conviction Rankings")
         conv_cols = st.columns(3)
         for _, crow in conviction_df.iterrows():
@@ -553,7 +561,7 @@ with tab_consensus:
 
         st.divider()
 
-        # ── Year-by-year vote heatmap ──────────────────────────────────────
+        # ── Year-by-year vote heatmap (unchanged) ─────────────────────────────
         if year_tops:
             st.subheader("🗳️ Year-by-Year Top Picks")
             st.caption("Which ETF ranked #1 for each training-start year window")
@@ -597,7 +605,7 @@ with tab_consensus:
             )
             st.plotly_chart(fig_heat, use_container_width=True)
 
-        # ── Conviction score breakdown bar chart ───────────────────────────
+        # ── Conviction score breakdown bar chart (unchanged) ───────────────────
         st.subheader("📐 Conviction Score Decomposition")
         st.caption(
             "How vote share, OOS directional accuracy and Hurst H "
@@ -632,7 +640,7 @@ with tab_consensus:
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
-        # ── Per-year flat detail table ─────────────────────────────────────
+        # ── Per-year flat detail table (unchanged) ────────────────────────────
         if flat_df is not None and len(flat_df) > 0:
             with st.expander("🔍 Per-Year Per-ETF Detail Table", expanded=False):
                 show_cols = [c for c in
@@ -900,8 +908,6 @@ with tab4:
     if rankings is not None and len(rankings) > 0 and ret_df is not None:
 
         # ── FIX: compute last trading day whose return is available ────────
-        # Returns are available for all completed trading days up to and
-        # including yesterday (or Friday if today is weekend).
         _today = pd.Timestamp(datetime.now().date())
         _last_td = last_trading_day_on_or_before(_today - timedelta(days=1))
 
@@ -926,7 +932,6 @@ with tab4:
             d   = row["date"]
             etf = row["etf"]
 
-            # ── FIX: only mark N/A if date is strictly after last trading day
             if d > _last_td:
                 actual_ret = None
             elif etf in ret_df.columns and d in ret_df.index:
