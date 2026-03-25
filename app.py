@@ -466,11 +466,8 @@ with tab_consensus:
         bdr_color = "#bbf7d0"
         etf_color = ETF_COLORS.get(top_etf, "#111827")
 
-        # ── Determine the date to display: prefer signal_date from the data ──
-        if "signal_date" in conviction_df.columns and not pd.isna(conviction_df["signal_date"].iloc[0]):
-            # Use the stored signal date (should be the next trading day)
-            consensus_signal_date = pd.Timestamp(conviction_df["signal_date"].iloc[0])
-        elif run_ts and run_ts != "unknown":
+        # ── Determine the date to display: use the run timestamp directly ──
+        if run_ts and run_ts != "unknown":
             consensus_signal_date = pd.Timestamp(run_ts[:10])
         else:
             consensus_signal_date = pd.Timestamp(datetime.now().date())
