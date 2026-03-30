@@ -17,6 +17,9 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Import from config
+from config import TARGET_ETFS, ETF_LABELS
+
 warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 
@@ -25,16 +28,6 @@ CONSENSUS_YEARS     = list(range(2008, 2025))   # 2008 → 2024 inclusive
 CONSENSUS_FILE      = "consensus/consensus_latest.parquet"
 CONSENSUS_DIR       = "consensus"
 TRAIN_SPLIT         = 0.80
-TARGET_ETFS         = ["TLT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
-
-ETF_LABELS = {
-    "TLT": "iShares 20yr Treasury",
-    "LQD": "iShares Inv Grade Corp",
-    "HYG": "iShares High Yield Bond",
-    "VNQ": "Vanguard Real Estate",
-    "GLD": "SPDR Gold Shares",
-    "SLV": "iShares Silver Trust",
-}
 
 
 # ── Helper ─────────────────────────────────────────────────────────────────────
