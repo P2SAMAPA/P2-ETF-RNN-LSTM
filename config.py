@@ -6,7 +6,22 @@ HF_SOURCE_DATASET   = "P2SAMAPA/p2-etf-deepwave-dl"
 HF_RESULTS_DATASET  = "P2SAMAPA/p2-etf-rnn-lstm-results"
 
 # ── ETFs ──────────────────────────────────────────────────────────────────────
-TARGET_ETFS         = ["TLT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
+# Fixed income ETFs (original set)
+FI_ETFS = ["TLT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
+
+# Equity ETFs (new module)
+EQUITY_ETFS = [
+    "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI",
+    "XLY", "XLP", "XLU", "XME", "GDX", "IWM"
+]
+
+# Combined list used by the training pipeline
+TARGET_ETFS = FI_ETFS + EQUITY_ETFS
+
+# Group mapping for UI (Streamlit)
+ETF_GROUP = {ticker: "FI" for ticker in FI_ETFS}
+ETF_GROUP.update({ticker: "Equity" for ticker in EQUITY_ETFS})
+
 BENCHMARK_TICKERS   = ["SPY", "AGG"]
 
 # ── Source parquet files (inside HF dataset /data/ folder) ───────────────────
