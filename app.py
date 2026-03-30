@@ -1,4 +1,4 @@
-# app.py  — P2-ETF-RNN-LSTM  (updated UI + Consensus Sweep tab)
+# app.py  — P2-ETF-RNN-LSTM  (updated UI + Consensus Sweep tab + group tabs)
 
 import os
 import warnings
@@ -10,6 +10,9 @@ import plotly.graph_objects as go
 from datetime import datetime, timezone, timedelta
 from huggingface_hub import hf_hub_download
 import pandas_market_calendars as mcal
+
+# Import ETF groups from config
+from config import FI_ETFS, EQUITY_ETFS, TARGET_ETFS
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.WARNING)
@@ -40,11 +43,11 @@ def next_trading_day(date: pd.Timestamp) -> pd.Timestamp:
 # ── Constants ──────────────────────────────────────────────────────────────────
 HF_RESULTS   = "P2SAMAPA/p2-etf-rnn-lstm-results"
 HF_SOURCE    = "P2SAMAPA/p2-etf-deepwave-dl"
-TARGET_ETFS  = ["TLT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
 TRAIN_SPLIT  = 0.80
 AUDIT_ROWS   = 15
 HURST_THRESH = 0.52
 
+# Extended ETF labels (include all FI + new equity ETFs)
 ETF_LABELS = {
     "TLT": "iShares 20yr Treasury",
     "LQD": "iShares Inv Grade Corp",
@@ -52,11 +55,27 @@ ETF_LABELS = {
     "VNQ": "Vanguard Real Estate",
     "GLD": "SPDR Gold Shares",
     "SLV": "iShares Silver Trust",
+    "QQQ": "Invesco QQQ Trust",
+    "XLK": "Technology Select Sector SPDR",
+    "XLF": "Financial Select Sector SPDR",
+    "XLE": "Energy Select Sector SPDR",
+    "XLV": "Health Care Select Sector SPDR",
+    "XLI": "Industrial Select Sector SPDR",
+    "XLY": "Consumer Discretionary Select Sector SPDR",
+    "XLP": "Consumer Staples Select Sector SPDR",
+    "XLU": "Utilities Select Sector SPDR",
+    "XME": "SPDR S&P Metals & Mining",
+    "GDX": "VanEck Gold Miners ETF",
+    "IWM": "iShares Russell 2000 ETF",
 }
 ETF_COLORS = {
     "TLT": "#0ea5e9", "LQD": "#ec4899", "HYG": "#10b981",
     "VNQ": "#8b5cf6", "GLD": "#f59e0b", "SLV": "#94a3b8",
     "SPY": "#6366f1", "AGG": "#84cc16",
+    # Equity colors (extend as needed)
+    "QQQ": "#00a1c9", "XLK": "#2c7da0", "XLF": "#2e8b57", "XLE": "#cd5c5c",
+    "XLV": "#e67e22", "XLI": "#3498db", "XLY": "#e74c3c", "XLP": "#2ecc71",
+    "XLU": "#f1c40f", "XME": "#95a5a6", "GDX": "#d35400", "IWM": "#9b59b6",
 }
 
 # Conviction weights (v2) — dir_acc replaces raw predicted return
@@ -305,7 +324,6 @@ elif rankings is not None and len(rankings) > 0:
     signal_source   = "📡 Last Scheduled Run (GitHub Actions)"
     latest_rankings = rankings[rankings["date"] == rankings["date"].max()].sort_values("rank")
     if len(latest_rankings) > 0:
-        # Use the date from the rankings directly — it already represents the target trading day.
         signal_date = pd.Timestamp(latest_rankings.iloc[0]["date"])
         signal_date_str = signal_date.strftime("%A %b %d, %Y")
     else:
@@ -315,7 +333,7 @@ else:
     signal_source   = ""
     signal_date_str = ""
 
-# ── Top Signal Banner ──────────────────────────────────────────────────────────
+# ── Top Signal Banner (combined) ───────────────────────────────────────────────
 if len(latest_rankings) > 0:
     top = latest_rankings.iloc[0]
     ret = top["predicted_return_pct"]
@@ -386,8 +404,93 @@ if len(latest_rankings) > 0:
 
 st.divider()
 
-# ── Tabs ───────────────────────────────────────────────────────────────────────
-tab1, tab_consensus, tab2, tab3, tab4, tab5 = st.tabs([
+# ── Helper to render a group tab (top banner + prediction cards) ─────────────
+def render_group_tab(group_etfs: list, group_name: str):
+    """Show top pick and all predictions for a specific group of ETFs."""
+    if len(latest_rankings) == 0:
+        st.info(f"No prediction data available for {group_name} ETFs yet.")
+        return
+
+    # Filter rankings to this group
+    group_rankings = latest_rankings[latest_rankings["etf"].isin(group_etfs)].copy()
+    if len(group_rankings) == 0:
+        st.info(f"No prediction data for {group_name} ETFs yet.")
+        return
+
+    # Re-sort by predicted return (highest first) and renumber ranks
+    group_rankings = group_rankings.sort_values("predicted_return_pct", ascending=False)
+    group_rankings["rank"] = range(1, len(group_rankings) + 1)
+
+    # Top pick banner
+    top = group_rankings.iloc[0]
+    ret = top["predicted_return_pct"]
+    ret_color = "#16a34a" if ret >= 0 else "#dc2626"
+    bg_color  = "#f0fdf4" if ret >= 0 else "#fef2f2"
+    bdr_color = "#bbf7d0" if ret >= 0 else "#fecaca"
+
+    st.markdown(f"""
+    <div style="background:{bg_color}; border:2px solid {bdr_color};
+                border-radius:12px; padding:22px 28px; margin-bottom:16px;">
+        <div style="font-size:11px; letter-spacing:3px; color:#6b7280; margin-bottom:8px;">
+            NEXT TRADING DAY SIGNAL — {group_name} · {signal_date_str}
+            <span style="float:right; font-size:10px; color:#9ca3af;">
+                MODEL: {top['model_used']}
+            </span>
+        </div>
+        <div style="font-size:52px; font-weight:900; color:#111827; line-height:1;">
+            {top['etf']}
+        </div>
+        <div style="font-size:13px; color:#6b7280; margin-top:4px;">
+            {ETF_LABELS.get(top['etf'], '')}
+        </div>
+        <div style="margin-top:10px; font-size:14px; color:#374151;">
+            Predicted Return:
+            <strong style="color:{ret_color};">
+                {'+' if ret >= 0 else ''}{ret:.3f}%
+            </strong>
+            &nbsp;·&nbsp; Dir Accuracy:
+            <strong style="color:#d97706;">{top['direction_accuracy']:.1f}%</strong>
+            &nbsp;·&nbsp; H =
+            <strong style="color:#0284c7;">{top['hurst_H']:.3f}</strong>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.subheader(f"📊 {group_name} ETF Predictions — Next Trading Day")
+    pred_cols = st.columns(3)
+    for i, row in group_rankings.iterrows():
+        cidx = int(row["rank"] - 1) % 3
+        etf  = row["etf"]
+        r    = row["predicted_return_pct"]
+        ret_col = "#16a34a" if r > 0 else "#dc2626"
+        bg      = "#f0fdf4" if r > 0 else "#fef2f2"
+        bdr     = "#bbf7d0" if r > 0 else "#fecaca"
+        etf_col = ETF_COLORS.get(etf, "#374151")
+        with pred_cols[cidx]:
+            st.markdown(f"""
+            <div style="border:1px solid {bdr}; border-radius:10px;
+                        padding:16px; margin-bottom:12px; background:{bg};">
+                <div style="font-size:10px; color:#9ca3af; margin-bottom:4px;">
+                    #{int(row['rank'])} · {ETF_LABELS.get(etf, etf)}
+                </div>
+                <div style="font-size:26px; font-weight:900; color:{etf_col};">{etf}</div>
+                <div style="font-size:22px; font-weight:700; color:{ret_col}; margin:4px 0;">
+                    {'+' if r > 0 else ''}{r:.3f}%
+                </div>
+                <div style="font-size:11px; color:#6b7280;">
+                    H={row['hurst_H']:.3f} · {row['model_used']}
+                    · Dir Acc {row['direction_accuracy']:.1f}%
+                </div>
+                <div style="font-size:11px; color:#9ca3af; margin-top:4px;">
+                    ${row['current_price']:.2f} → ${row['predicted_price']:.2f}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+# ── Tabs: First two are group tabs, then the original tabs ────────────────────
+tabs = st.tabs([
+    "🏛️ Fixed Income ETFs",
+    "⚡ Equity ETFs",
     "📈 OOS Forecast Chart",
     "🔁 Consensus Sweep",
     "📊 Model Performance",
@@ -396,10 +499,105 @@ tab1, tab_consensus, tab2, tab3, tab4, tab5 = st.tabs([
     "ℹ️ About the Model",
 ])
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB — CONSENSUS SWEEP
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_consensus:
+# Tab 0: Fixed Income
+with tabs[0]:
+    render_group_tab(FI_ETFS, "Fixed Income")
+
+# Tab 1: Equity
+with tabs[1]:
+    render_group_tab(EQUITY_ETFS, "Equity")
+
+# The remaining tabs (2 to 7) are unchanged from the original app.
+# We'll copy them exactly as they were, but with the new index.
+# For clarity, we keep the original tab content under their respective positions.
+
+# Tab 2: OOS Forecast Chart
+with tabs[2]:
+    st.subheader("OOS Period: Cumulative Return — Model Signal vs Benchmark")
+    st.caption("Cumulative actual return of the model's top-ranked ETF each day vs the selected benchmark.")
+
+    bench_choice = benchmark if benchmark != "None" else "SPY"
+
+    if audit_df is not None and len(audit_df) > 0 and ret_df is not None:
+
+        oos = audit_df.copy()
+        oos["date"] = pd.to_datetime(oos["date"])
+        oos = oos.sort_values("date")
+
+        if rankings is not None:
+            rank1 = (rankings[rankings["rank"] == 1][["date", "etf"]]
+                     .rename(columns={"etf": "top_etf"}))
+            rank1["date"] = pd.to_datetime(rank1["date"])
+        else:
+            rank1 = (oos.groupby("date")
+                     .apply(lambda g: g.loc[g["predicted_ret_pct"].idxmax(), "signal_etf"]
+                            if "predicted_ret_pct" in g.columns else g.iloc[0]["signal_etf"])
+                     .reset_index().rename(columns={0: "top_etf"}))
+
+        signal_rets = []
+        for _, row in rank1.iterrows():
+            d   = row["date"]
+            etf = row["top_etf"]
+            if etf in ret_df.columns and d in ret_df.index:
+                signal_rets.append({"date": d, "signal_ret": float(ret_df.loc[d, etf])})
+            else:
+                signal_rets.append({"date": d, "signal_ret": np.nan})
+
+        signal_df = pd.DataFrame(signal_rets).dropna().set_index("date").sort_index()
+
+        bench_rets = None
+        if bench_choice != "None" and bench_ret is not None and bench_choice in bench_ret.columns:
+            bench_rets = bench_ret[bench_choice].reindex(signal_df.index).dropna()
+
+        if len(signal_df) >= 2:
+            cum_signal = (1 + signal_df["signal_ret"]).cumprod() - 1
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=cum_signal.index, y=cum_signal.values * 100,
+                mode="lines", name="Model Signal",
+                line=dict(color="#0ea5e9", width=2.5),
+            ))
+
+            if bench_rets is not None and len(bench_rets) >= 2:
+                cum_bench = (1 + bench_rets).cumprod() - 1
+                fig.add_trace(go.Scatter(
+                    x=cum_bench.index, y=cum_bench.values * 100,
+                    mode="lines", name=bench_choice,
+                    line=dict(color=ETF_COLORS.get(bench_choice, "#6366f1"),
+                              width=1.8, dash="dot"),
+                ))
+
+            fig.update_layout(
+                height=440,
+                **CHART_LAYOUT,
+                title="Cumulative Return — OOS Period (%)",
+                xaxis=dict(gridcolor="#e2e8f0", title="Date"),
+                yaxis=dict(gridcolor="#e2e8f0", title="Cumulative Return (%)"),
+                legend=dict(bgcolor="#ffffff", bordercolor="#e2e8f0", borderwidth=1),
+                margin=dict(l=0, r=0, t=40, b=0),
+            )
+            fig.add_hline(y=0, line_color="#94a3b8", line_dash="dot")
+            st.plotly_chart(fig, use_container_width=True)
+
+            total_ret = float(cum_signal.iloc[-1]) * 100
+            n_days    = len(signal_df)
+            ann_ret   = ((1 + total_ret / 100) ** (252 / n_days) - 1) * 100 if n_days > 0 else 0
+            daily_std = float(signal_df["signal_ret"].std()) * np.sqrt(252) * 100
+            sharpe    = ann_ret / daily_std if daily_std > 0 else 0
+
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("Total OOS Return", f"{total_ret:+.2f}%")
+            sc2.metric("Ann. Return (est.)", f"{ann_ret:+.2f}%")
+            sc3.metric("Ann. Volatility", f"{daily_std:.2f}%")
+            sc4.metric("Sharpe (est.)", f"{sharpe:.2f}")
+        else:
+            st.info("Not enough OOS data yet to plot.")
+    else:
+        st.info("OOS chart will appear once the training pipeline has run and the audit trail is populated.")
+
+# Tab 3: Consensus Sweep (unchanged)
+with tabs[3]:
     st.subheader("🔁 Consensus Sweep — All Training Windows (2008–2024)")
     st.caption(
         "Each year from 2008 to 2024 is used as a training-start cutoff. "
@@ -670,99 +868,8 @@ with tab_consensus:
             "Only the latest run is kept on HuggingFace — previous stamped files are deleted automatically."
         )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — OOS CUMULATIVE RETURN CHART
-# ══════════════════════════════════════════════════════════════════════════════
-with tab1:
-    st.subheader("OOS Period: Cumulative Return — Model Signal vs Benchmark")
-    st.caption("Cumulative actual return of the model's top-ranked ETF each day vs the selected benchmark.")
-
-    bench_choice = benchmark if benchmark != "None" else "SPY"
-
-    if audit_df is not None and len(audit_df) > 0 and ret_df is not None:
-
-        oos = audit_df.copy()
-        oos["date"] = pd.to_datetime(oos["date"])
-        oos = oos.sort_values("date")
-
-        if rankings is not None:
-            rank1 = (rankings[rankings["rank"] == 1][["date", "etf"]]
-                     .rename(columns={"etf": "top_etf"}))
-            rank1["date"] = pd.to_datetime(rank1["date"])
-        else:
-            rank1 = (oos.groupby("date")
-                     .apply(lambda g: g.loc[g["predicted_ret_pct"].idxmax(), "signal_etf"]
-                            if "predicted_ret_pct" in g.columns else g.iloc[0]["signal_etf"])
-                     .reset_index().rename(columns={0: "top_etf"}))
-
-        signal_rets = []
-        for _, row in rank1.iterrows():
-            d   = row["date"]
-            etf = row["top_etf"]
-            if etf in ret_df.columns and d in ret_df.index:
-                signal_rets.append({"date": d, "signal_ret": float(ret_df.loc[d, etf])})
-            else:
-                signal_rets.append({"date": d, "signal_ret": np.nan})
-
-        signal_df = pd.DataFrame(signal_rets).dropna().set_index("date").sort_index()
-
-        bench_rets = None
-        if bench_choice != "None" and bench_ret is not None and bench_choice in bench_ret.columns:
-            bench_rets = bench_ret[bench_choice].reindex(signal_df.index).dropna()
-
-        if len(signal_df) >= 2:
-            cum_signal = (1 + signal_df["signal_ret"]).cumprod() - 1
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=cum_signal.index, y=cum_signal.values * 100,
-                mode="lines", name="Model Signal",
-                line=dict(color="#0ea5e9", width=2.5),
-            ))
-
-            if bench_rets is not None and len(bench_rets) >= 2:
-                cum_bench = (1 + bench_rets).cumprod() - 1
-                fig.add_trace(go.Scatter(
-                    x=cum_bench.index, y=cum_bench.values * 100,
-                    mode="lines", name=bench_choice,
-                    line=dict(color=ETF_COLORS.get(bench_choice, "#6366f1"),
-                              width=1.8, dash="dot"),
-                ))
-
-            fig.update_layout(
-                height=440,
-                **CHART_LAYOUT,
-                title="Cumulative Return — OOS Period (%)",
-                xaxis=dict(gridcolor="#e2e8f0", title="Date"),
-                yaxis=dict(gridcolor="#e2e8f0", title="Cumulative Return (%)"),
-                legend=dict(bgcolor="#ffffff", bordercolor="#e2e8f0", borderwidth=1),
-                margin=dict(l=0, r=0, t=40, b=0),
-            )
-            fig.add_hline(y=0, line_color="#94a3b8", line_dash="dot")
-            st.plotly_chart(fig, use_container_width=True)
-
-            total_ret = float(cum_signal.iloc[-1]) * 100
-            n_days    = len(signal_df)
-            ann_ret   = ((1 + total_ret / 100) ** (252 / n_days) - 1) * 100 if n_days > 0 else 0
-            daily_std = float(signal_df["signal_ret"].std()) * np.sqrt(252) * 100
-            sharpe    = ann_ret / daily_std if daily_std > 0 else 0
-
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("Total OOS Return", f"{total_ret:+.2f}%")
-            sc2.metric("Ann. Return (est.)", f"{ann_ret:+.2f}%")
-            sc3.metric("Ann. Volatility", f"{daily_std:.2f}%")
-            sc4.metric("Sharpe (est.)", f"{sharpe:.2f}")
-        else:
-            st.info("Not enough OOS data yet to plot.")
-    else:
-        st.info("OOS chart will appear once the training pipeline has run and the audit trail is populated.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — MODEL PERFORMANCE
-# ══════════════════════════════════════════════════════════════════════════════
-with tab2:
+# Tab 4: Model Performance (unchanged)
+with tabs[4]:
     st.subheader("📊 OOS Model Performance")
 
     def compute_performance(audit, bench_ret_df, bench_col, rankings_df):
@@ -848,11 +955,8 @@ with tab2:
     else:
         st.info("No performance data yet. Run the training pipeline for at least 2 days.")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — HURST ANALYSIS
-# ══════════════════════════════════════════════════════════════════════════════
-with tab3:
+# Tab 5: Hurst Analysis (unchanged)
+with tabs[5]:
     st.subheader("🌊 Hurst Exponent — Model Selection Logic")
     st.markdown("""
     The **Hurst Exponent (H)** via R/S analysis determines which model is used per ETF:
@@ -892,11 +996,8 @@ with tab3:
     else:
         st.info("Hurst analysis will appear after the first training run.")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — AUDIT TRAIL
-# ══════════════════════════════════════════════════════════════════════════════
-with tab4:
+# Tab 6: Audit Trail (unchanged)
+with tabs[6]:
     st.subheader("📋 Audit Trail — Last 15 Trading Days")
     st.caption("One row per day · Top pick ETF · Actual return from source data · N/A = today")
 
@@ -980,11 +1081,8 @@ with tab4:
     else:
         st.info("Audit trail will populate after the first training run.")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — ABOUT
-# ══════════════════════════════════════════════════════════════════════════════
-with tab5:
+# Tab 7: About (unchanged)
+with tabs[7]:
     st.subheader("ℹ️ About the ARMA-RNN-LSTM Model")
     st.markdown("""
     ### 📄 Paper Reference
