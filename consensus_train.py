@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 import torch
 from config import (
     TARGET_ETFS, TRAIN_SPLIT, LOOKBACK, SEED,
-    HF_RESULTS_DATASET,
+    HF_RESULTS_DATASET, ETF_LABELS,          # <-- added ETF_LABELS
 )
 from data_loader import (
     load_all_data, build_feature_matrix, make_sequences,
@@ -66,14 +66,7 @@ CONVICTION_W = {
     "hurst":   0.25,
 }
 
-ETF_LABELS = {
-    "TLT": "iShares 20yr Treasury",
-    "LQD": "iShares Inv Grade Corp",
-    "HYG": "iShares High Yield Bond",
-    "VNQ": "Vanguard Real Estate",
-    "GLD": "SPDR Gold Shares",
-    "SLV": "iShares Silver Trust",
-}
+# ETF_LABELS is now imported from config — no need to define here
 
 
 # ── Helper: next trading day ───────────────────────────────────────────────────
