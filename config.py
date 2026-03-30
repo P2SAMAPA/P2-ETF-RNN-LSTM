@@ -22,6 +22,28 @@ TARGET_ETFS = FI_ETFS + EQUITY_ETFS
 ETF_GROUP = {ticker: "FI" for ticker in FI_ETFS}
 ETF_GROUP.update({ticker: "Equity" for ticker in EQUITY_ETFS})
 
+# ── ETF Labels for UI (centralised) ────────────────────────────────────────────
+ETF_LABELS = {
+    "TLT": "iShares 20yr Treasury",
+    "LQD": "iShares Inv Grade Corp",
+    "HYG": "iShares High Yield Bond",
+    "VNQ": "Vanguard Real Estate",
+    "GLD": "SPDR Gold Shares",
+    "SLV": "iShares Silver Trust",
+    "QQQ": "Invesco QQQ Trust",
+    "XLK": "Technology Select Sector SPDR",
+    "XLF": "Financial Select Sector SPDR",
+    "XLE": "Energy Select Sector SPDR",
+    "XLV": "Health Care Select Sector SPDR",
+    "XLI": "Industrial Select Sector SPDR",
+    "XLY": "Consumer Discretionary Select Sector SPDR",
+    "XLP": "Consumer Staples Select Sector SPDR",
+    "XLU": "Utilities Select Sector SPDR",
+    "XME": "SPDR S&P Metals & Mining",
+    "GDX": "VanEck Gold Miners ETF",
+    "IWM": "iShares Russell 2000 ETF",
+}
+
 BENCHMARK_TICKERS   = ["SPY", "AGG"]
 
 # ── Source parquet files (inside HF dataset /data/ folder) ───────────────────
