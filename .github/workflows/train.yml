@@ -2,8 +2,8 @@ name: Daily ETF Training Pipeline
 
 on:
   schedule:
-    # Run at 23:00 UTC = 4:00 PM ET (post US market close, Mon-Fri)
-    - cron: '0 23 * * 1-5'
+    # Run at 01:30 UTC = 8:30 PM ET (post US market close, Mon-Fri)
+    - cron: '30 01 * * 1-5'
   workflow_dispatch:
     inputs:
       retrain_from_scratch:
