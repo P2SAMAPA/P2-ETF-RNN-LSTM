@@ -1,9 +1,9 @@
 name: Consensus Sweep
 
 on:
-  # ── Scheduled: daily at 8 PM EST (1 AM UTC next day, weekdays only) ────────
+  # ── Scheduled: daily at 9:30 PM EST (1 AM UTC next day, weekdays only) ────────
   schedule:
-    - cron: "0 1 * * 2-6"   # Tue–Sat 01:00 UTC = Mon–Fri 8:00 PM EST
+    - cron: "30 2 * * 2-6"   # Tue–Sat 01:00 UTC = Mon–Fri 8:00 PM EST
 
   # ── Manual trigger from GitHub Actions UI ──────────────────────────────────
   workflow_dispatch:
