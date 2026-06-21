@@ -300,7 +300,7 @@ def _compute_metrics(y_true, y_hybrid, y_rnn=None, y_combined=None) -> dict:
         a, b = a[:min_len], b[:min_len]
         if len(a) < 2:
             return 0.0
-        return float(np.mean(np.sign(a[1:]) == np.sign(b[1:])) * 100
+        return float(np.mean(np.sign(a[1:]) == np.sign(b[1:])) * 100)
 
     metrics = {
         "hybrid_mae":     mae(y_true, y_hybrid),
