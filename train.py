@@ -44,7 +44,7 @@ from data_loader import (
     train_test_split_sequences, Normaliser,
 )
 from hurst import compute_hurst_all_etfs
-from trainer import train_pipeline
+from trainer import train_pipeline, _unpack_pred
 from hf_io import (
     save_predictions, save_rankings, save_metrics,
     save_audit_trail, save_model_weights, load_model_weights,
@@ -157,20 +157,31 @@ def main():
 
             X_t = th.tensor(X_last, dtype=th.float32).to(device)
             with th.no_grad():
-                rnn_p   = rnn(X_t).cpu().numpy()
-                res_p   = rlstm(X_t).cpu().numpy()
+                # FIX: Unpack tuple from RNN output
+                rnn_pred = _unpack_pred(rnn(X_t))
+                rnn_p = rnn_pred.cpu().numpy()
+                
+                # FIX: Unpack tuple from ResidualLSTM output
+                res_pred = _unpack_pred(rlstm(X_t))
+                res_p = res_pred.cpu().numpy()
+                
                 rnn_col  = np.full((1, X_last.shape[1], 1), rnn_p[0])
                 lstm_col = np.full((1, X_last.shape[1], 1), res_p[0])
                 X_aug    = np.concatenate([X_last, rnn_col, lstm_col], axis=-1)
                 X_aug_t  = th.tensor(X_aug, dtype=th.float32).to(device)
-                pred_logret = hlstm(X_aug_t).cpu().numpy()[0]
+                
+                # FIX: Unpack tuple from HybridLSTM output
+                hybrid_pred = _unpack_pred(hlstm(X_aug_t))
+                pred_logret = hybrid_pred.cpu().numpy()[0]
         else:
             import torch as th
             rnn = result["rnn"]
             rnn.eval()
             X_t = th.tensor(X_last, dtype=th.float32).to(device)
             with th.no_grad():
-                pred_logret = rnn(X_t).cpu().numpy()[0]
+                # FIX: Unpack tuple from RNN output
+                rnn_pred = _unpack_pred(rnn(X_t))
+                pred_logret = rnn_pred.cpu().numpy()[0]
 
         current_price = float(data["price"][etf].iloc[-1])
         pred_price    = current_price * np.exp(pred_logret)
