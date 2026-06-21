@@ -87,7 +87,7 @@ def last_trading_day_on_or_before(ref: pd.Timestamp) -> pd.Timestamp:
         d -= timedelta(days=1)
     return d
 
-# ── Sidebar (unchanged) ───────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.image("https://huggingface.co/front/assets/huggingface_logo-noborder.svg", width=36)
     st.title("P2-ETF RNN-LSTM")
@@ -115,7 +115,7 @@ with st.sidebar:
                                    use_container_width=True,
                                    help="Re-fetch the latest consensus results from HuggingFace.")
 
-# ── Data loaders (unchanged) ─────────────────────────────────────────────────
+# ── Data loaders ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_results_parquet(filename: str) -> pd.DataFrame | None:
     token = os.environ.get("HF_TOKEN", "")
@@ -173,7 +173,7 @@ if refresh_consensus:
     load_consensus_from_hf.clear()
     st.rerun()
 
-# ── Load all data (once) ─────────────────────────────────────────────────────
+# ── Load all data ──────────────────────────────────────────────────────────────
 with st.spinner("Loading latest results from HuggingFace…"):
     predictions = load_results_parquet("predictions.parquet")
     rankings    = load_results_parquet("rankings.parquet")
@@ -184,7 +184,7 @@ with st.spinner("Loading latest results from HuggingFace…"):
     bench_ret   = load_source_parquet("data/bench_ret.parquet")
     bench_price = load_source_parquet("data/bench_price.parquet")
 
-# ── Status badges (overall) ───────────────────────────────────────────────────
+# ── Status badges ──────────────────────────────────────────────────────────────
 st.markdown("## 📈 P2-ETF RNN-LSTM Neural Forecasting Engine")
 st.caption("ARMA-RNN-LSTM Hybrid Model · Xiao (2025) PLoS ONE")
 c1, c2, c3, c4 = st.columns(4)
@@ -208,7 +208,7 @@ else:
 st.divider()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LIVE INFERENCE FUNCTION (unchanged, uses TARGET_ETFS)
+# LIVE INFERENCE FUNCTION
 # ══════════════════════════════════════════════════════════════════════════════
 def _run_live_inference(price_df, ret_df, start_year):
     if price_df is None:
@@ -275,7 +275,7 @@ def _run_live_inference(price_df, ret_df, start_year):
 if run_inference:
     _run_live_inference(price_df, ret_df, start_year)
 
-# ── Determine signal source for the current session (used in group tabs) ──────
+# ── Determine signal source ──────────────────────────────────────────────────
 live_ran     = st.session_state.get("live_ran", False)
 live_results = st.session_state.get("live_results", [])
 
@@ -357,9 +357,9 @@ def render_dashboard_for_group(group_etfs, group_name):
             # Signal source displayed as plain text outside the HTML div
             st.caption(f"Signal source: {signal_source}")
             
-            st.markdown(f"""
-            <div style="background:{bg_color}; border:2px solid {bdr_color};
-                        border-radius:12px; padding:22px 28px; margin-bottom:16px;">
+            # Create the HTML content as a clean string
+            html_content = f"""
+            <div style="background:{bg_color}; border:2px solid {bdr_color}; border-radius:12px; padding:22px 28px; margin-bottom:16px;">
                 <div style="font-size:11px; letter-spacing:3px; color:#6b7280; margin-bottom:8px;">
                     NEXT TRADING DAY SIGNAL — {group_name} · {signal_date_str}
                     <span style="float:right; font-size:10px; color:#9ca3af;">
@@ -374,16 +374,17 @@ def render_dashboard_for_group(group_etfs, group_name):
                 </div>
                 <div style="margin-top:10px; font-size:14px; color:#374151;">
                     Predicted Return:
-                    <strong style="color:{ret_color};">
-                        {'+' if ret >= 0 else ''}{ret:.3f}%
-                    </strong>
+                    <strong style="color:{ret_color};">{'%+.3f' % ret}%</strong>
                     &nbsp;·&nbsp; Dir Accuracy:
                     <strong style="color:#d97706;">{top['direction_accuracy']:.1f}%</strong>
                     &nbsp;·&nbsp; H =
                     <strong style="color:#0284c7;">{top['hurst_H']:.3f}</strong>
                 </div>
             </div>
-            """, unsafe_allow_html=True)
+            """
+            
+            # Use st.markdown with unsafe_allow_html=True
+            st.markdown(html_content, unsafe_allow_html=True)
 
             st.subheader(f"📊 {group_name} ETF Predictions — Next Trading Day")
             pred_cols = st.columns(3)
@@ -396,15 +397,14 @@ def render_dashboard_for_group(group_etfs, group_name):
                 bdr     = "#bbf7d0" if r > 0 else "#fecaca"
                 etf_col = ETF_COLORS.get(etf, "#374151")
                 with pred_cols[cidx]:
-                    st.markdown(f"""
-                    <div style="border:1px solid {bdr}; border-radius:10px;
-                                padding:16px; margin-bottom:12px; background:{bg};">
+                    card_html = f"""
+                    <div style="border:1px solid {bdr}; border-radius:10px; padding:16px; margin-bottom:12px; background:{bg};">
                         <div style="font-size:10px; color:#9ca3af; margin-bottom:4px;">
                             #{int(row['rank'])} · {ETF_LABELS.get(etf, etf)}
                         </div>
                         <div style="font-size:26px; font-weight:900; color:{etf_col};">{etf}</div>
                         <div style="font-size:22px; font-weight:700; color:{ret_col}; margin:4px 0;">
-                            {'+' if r > 0 else ''}{r:.3f}%
+                            {'%+.3f' % r}%
                         </div>
                         <div style="font-size:11px; color:#6b7280;">
                             H={row['hurst_H']:.3f} · {row['model_used']}
@@ -414,7 +414,8 @@ def render_dashboard_for_group(group_etfs, group_name):
                             ${row['current_price']:.2f} → ${row['predicted_price']:.2f}
                         </div>
                     </div>
-                    """, unsafe_allow_html=True)
+                    """
+                    st.markdown(card_html, unsafe_allow_html=True)
 
     # ------------------ Tab 1: OOS Forecast Chart ------------------
     with subtabs[1]:
@@ -500,7 +501,7 @@ def render_dashboard_for_group(group_etfs, group_name):
         else:
             st.info("OOS chart will appear once the training pipeline has run and the audit trail is populated.")
 
-    # ------------------ Tab 2: Consensus Sweep (filtered) ------------------
+    # ------------------ Tab 2: Consensus Sweep ------------------
     with subtabs[2]:
         st.subheader("🔁 Consensus Sweep — All Training Windows (2008–2024)")
         st.caption(
@@ -665,7 +666,7 @@ def render_dashboard_for_group(group_etfs, group_name):
                 st.caption("Which ETF ranked #1 for each training-start year window")
 
                 years_sorted = sorted(year_tops.keys())
-                heat_etfs    = group_etfs  # only show ETFs in this group
+                heat_etfs    = group_etfs
 
                 z_colored = []
                 for i, etf in enumerate(heat_etfs):
@@ -771,7 +772,7 @@ def render_dashboard_for_group(group_etfs, group_name):
                 "Only the latest run is kept on HuggingFace — previous stamped files are deleted automatically."
             )
 
-    # ------------------ Tab 3: Model Performance (filtered) ------------------
+    # ------------------ Tab 3: Model Performance ------------------
     with subtabs[3]:
         st.subheader("📊 OOS Model Performance")
 
@@ -858,7 +859,7 @@ def render_dashboard_for_group(group_etfs, group_name):
         else:
             st.info("No performance data yet. Run the training pipeline for at least 2 days.")
 
-    # ------------------ Tab 4: Hurst Analysis (filtered) ------------------
+    # ------------------ Tab 4: Hurst Analysis ------------------
     with subtabs[4]:
         st.subheader("🌊 Hurst Exponent — Model Selection Logic")
         st.markdown("""
@@ -899,7 +900,7 @@ def render_dashboard_for_group(group_etfs, group_name):
         else:
             st.info("Hurst analysis will appear after the first training run.")
 
-    # ------------------ Tab 5: Audit Trail (filtered) ------------------
+    # ------------------ Tab 5: Audit Trail ------------------
     with subtabs[5]:
         st.subheader("📋 Audit Trail — Last 15 Trading Days")
         st.caption("One row per day · Top pick ETF · Actual return from source data · N/A = today")
@@ -983,7 +984,7 @@ def render_dashboard_for_group(group_etfs, group_name):
         else:
             st.info("Audit trail will populate after the first training run.")
 
-    # ------------------ Tab 6: About (unchanged, but group‑aware) ------------------
+    # ------------------ Tab 6: About ------------------
     with subtabs[6]:
         st.subheader("ℹ️ About the ARMA-RNN-LSTM Model")
         st.markdown("""
