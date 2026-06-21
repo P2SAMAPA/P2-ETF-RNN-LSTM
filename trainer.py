@@ -171,9 +171,9 @@ def train_pipeline(
 
     result = {"etf": etf, "use_hybrid": use_hybrid, "stage_histories": {}}
 
-    # ══════════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════
     # STAGE 1 — SimpleRNN: capture short-term memory
-    # ══════════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════
     logger.info(f"\n  ── Stage 1: SimpleRNN (short-term memory) ──")
     rnn    = SimpleRNN(input_size=n_features)
     hist1  = _train_one_model(rnn, train_loader, val_loader, EPOCHS_RNN,
@@ -182,7 +182,7 @@ def train_pipeline(
     result["stage_histories"]["rnn"]    = hist1
 
     rnn_train_preds = _get_predictions(rnn, X_train, device)
-    rnn_test_preds  = _get_predictions(rnn, X_test,  device)
+    rnn_test_preds  = _get_predictions(rnn, X_test, device)
 
     if not use_hybrid:
         logger.info(f"  [{etf}] H≈0.5 → using RNN only (no hybrid)")
@@ -195,7 +195,7 @@ def train_pipeline(
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 2 — ResidualLSTM: capture long-term memory from RNN residuals
     # ══════════════════════════════════════════════════════════════════════════
-    logger.info(f"\n  ── Stage 2: ResidualLSTM (long-term memory from residuals) ──")
+    logger.info(f"\n  Stage 2: ResidualLSTM (long-term memory from residuals) ──")
     rnn_residuals_train = y_train - rnn_train_preds
 
     # Build rolling windows of the 1D residuals
@@ -238,9 +238,9 @@ def train_pipeline(
     combined_train = rnn_train_preds + lstm_train_preds
     combined_test  = rnn_test_preds  + lstm_test_preds
 
-    # ══════════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════════
     # STAGE 3 — HybridLSTM: integrate short + long term for final forecast
-    # ══════════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════════
     logger.info(f"\n  ── Stage 3: HybridLSTM (final integration) ──")
 
     # CRITICAL FIX: Slice predictions to match the X_tr split BEFORE creating lagged sequences
