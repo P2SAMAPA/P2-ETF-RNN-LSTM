@@ -353,7 +353,10 @@ def render_dashboard_for_group(group_etfs, group_name):
             ret_color = "#16a34a" if ret >= 0 else "#dc2626"
             bg_color  = "#f0fdf4" if ret >= 0 else "#fef2f2"
             bdr_color = "#bbf7d0" if ret >= 0 else "#fecaca"
+            
+            # Signal source displayed as plain text outside the HTML div
             st.caption(f"Signal source: {signal_source}")
+            
             st.markdown(f"""
             <div style="background:{bg_color}; border:2px solid {bdr_color};
                         border-radius:12px; padding:22px 28px; margin-bottom:16px;">
