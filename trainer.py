@@ -34,7 +34,7 @@ def _make_loader(X: np.ndarray, y: np.ndarray,
 
 def _create_lagged_sequences(preds_1d: np.ndarray, lookback: int) -> np.ndarray:
     """
-    CRITICAL FIX: Create strictly lagged AR terms to prevent look-ahead bias.
+    Create strictly lagged AR terms to prevent look-ahead bias.
     For sample i, the sequence gets preds[i-1] appended. 
     We DO NOT append preds[i] (which is the target being predicted).
     """
@@ -47,7 +47,7 @@ def _create_lagged_sequences(preds_1d: np.ndarray, lookback: int) -> np.ndarray:
 
 def _create_residual_sequences(residuals_1d: np.ndarray, lookback: int) -> np.ndarray:
     """
-    CRITICAL FIX: Build proper rolling windows for the 1D residual series.
+    Build proper rolling windows for the 1D residual series.
     The ResidualLSTM expects input shape (N, lookback, 1).
     """
     N = len(residuals_1d)
@@ -55,6 +55,13 @@ def _create_residual_sequences(residuals_1d: np.ndarray, lookback: int) -> np.nd
     for i in range(lookback, N):
         res_seq[i, :, 0] = residuals_1d[i - lookback : i]
     return res_seq
+
+
+def _unpack_pred(pred):
+    """Extract the prediction tensor from the (pred, hidden_state) tuple."""
+    if isinstance(pred, tuple):
+        return pred[0]
+    return pred
 
 
 def _train_one_model(
@@ -79,37 +86,28 @@ def _train_one_model(
     history = []
 
     for epoch in range(1, epochs + 1):
+        # ── Train ──
         model.train()
         train_loss = 0.0
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             optimiser.zero_grad()
-            
-            # Unpack tuple returns if present (from updated models.py)
-            if isinstance(X_batch, tuple):
-                preds = model(*X_batch)
-            else:
-                preds = model(X_batch)
-                
+            preds = _unpack_pred(model(X_batch)) # CRITICAL FIX: Unpack tuple
             loss  = criterion(preds, y_batch)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimiser.step()
-            train_loss += loss.item() * len(y_batch)
+            train_loss += loss.item() * len(X_batch)
         train_loss /= len(train_loader.dataset)
 
+        # ── Validate ──
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                
-                if isinstance(X_batch, tuple):
-                    preds = model(*X_batch)
-                else:
-                    preds = model(X_batch)
-                    
-                val_loss += criterion(preds, y_batch).item() * len(y_batch)
+                preds = _unpack_pred(model(X_batch)) # CRITICAL FIX: Unpack tuple
+                val_loss += criterion(preds, y_batch).item() * len(X_batch)
         val_loss /= len(val_loader.dataset)
 
         scheduler.step(val_loss)
@@ -119,6 +117,7 @@ def _train_one_model(
             logger.info(f"  [{label}] Epoch {epoch:3d}/{epochs} | "
                         f"Train MSE: {train_loss:.6f} | Val MSE: {val_loss:.6f}")
 
+        # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -142,8 +141,8 @@ def _get_predictions(model: nn.Module, X: np.ndarray,
     model.to(device)
     X_t  = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
-        preds = model(X_t).cpu().numpy()
-    return preds
+        preds = _unpack_pred(model(X_t)) # CRITICAL FIX: Unpack tuple
+        return preds.cpu().numpy()
 
 
 def train_pipeline(
@@ -195,12 +194,11 @@ def train_pipeline(
 
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 2 — ResidualLSTM: capture long-term memory from RNN residuals
-    # CRITICAL FIX: Build rolling windows of the 1D residuals as LSTM input.
     # ══════════════════════════════════════════════════════════════════════════
     logger.info(f"\n  ── Stage 2: ResidualLSTM (long-term memory from residuals) ──")
     rnn_residuals_train = y_train - rnn_train_preds   # ε_t,RNN (1D array)
 
-    # CRITICAL FIX: Correctly shape residuals for the 1D LSTM
+    # Build rolling windows of the 1D residuals
     res_seq_train = _create_residual_sequences(rnn_residuals_train, lookback)
     res_seq_val   = res_seq_train[val_split:]
     res_seq_tr    = res_seq_train[:val_split]
@@ -217,7 +215,7 @@ def train_pipeline(
     res_targets_train = rnn_residuals_train[lookback:]
     res_targets_val   = rnn_residuals_train[val_split + lookback - 1 : len(rnn_residuals_train)]
 
-    # Ensure lengths match exactly (off-by-one safety)
+    # Ensure lengths match exactly
     min_len = min(len(res_seq_tr), len(res_targets_train))
     res_seq_tr, res_targets_train = res_seq_tr[:min_len], res_targets_train[:min_len]
     min_len_v = min(len(res_seq_val), len(res_targets_val))
@@ -226,17 +224,12 @@ def train_pipeline(
     res_train_loader = _make_loader(res_seq_tr, res_targets_train, BATCH_SIZE, shuffle=True)
     res_val_loader   = _make_loader(res_seq_val, res_targets_val, BATCH_SIZE, shuffle=False)
 
-    # CRITICAL FIX: Instantiate with input_size=1 as designed in models.py
     residual_lstm = ResidualLSTM(input_size=1)
     hist2         = _train_one_model(residual_lstm, res_train_loader, res_val_loader,
                                      EPOCHS_LSTM1, f"{etf}/ResidualLSTM", device)
     result["residual_lstm"]                       = residual_lstm
     result["stage_histories"]["residual_lstm"]    = hist2
 
-    # To get predictions on the full train/test sets, we have to run the residual 
-    # LSTM autoregressively on the residuals, but for simplicity and to avoid 
-    # cascading errors during validation, we use the RNN's direct residual prediction.
-    # In production inference, this would be a sequential loop.
     lstm_train_preds = _get_predictions(residual_lstm, res_seq_train, device)
     lstm_test_preds  = _get_predictions(residual_lstm, 
                                         _create_residual_sequences(y_test - rnn_test_preds, lookback), 
@@ -247,7 +240,6 @@ def train_pipeline(
 
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 3 — HybridLSTM: integrate short + long term for final forecast
-    # CRITICAL FIX: Append strictly LAGGED predictions to prevent look-ahead bias.
     # ══════════════════════════════════════════════════════════════════════════
     logger.info(f"\n  ── Stage 3: HybridLSTM (final integration) ──")
 
@@ -276,7 +268,6 @@ def train_pipeline(
     hybrid_train_preds = _get_predictions(hybrid_lstm, X_train_aug, device)
     hybrid_test_preds  = _get_predictions(hybrid_lstm, X_test_aug,  device)
 
-    # CRITICAL FIX: Typo corrected (was assigning test preds to train key)
     result["train_preds"]          = hybrid_train_preds
     result["test_preds"]           = hybrid_test_preds
     result["rnn_test_preds"]       = rnn_test_preds
@@ -293,7 +284,6 @@ def _compute_metrics(y_true, y_hybrid, y_rnn=None, y_combined=None) -> dict:
     """Compute MAE, RMSE, and directional accuracy for each model variant."""
 
     def mae(a, b):
-        # Handle potential length mismatches from residual sequence trimming
         min_len = min(len(a), len(b))
         return float(np.mean(np.abs(a[:min_len] - b[:min_len])))
 
