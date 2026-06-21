@@ -92,7 +92,7 @@ def _train_one_model(
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             optimiser.zero_grad()
-            preds = _unpack_pred(model(X_batch)) # CRITICAL FIX: Unpack tuple
+            preds = _unpack_pred(model(X_batch))
             loss  = criterion(preds, y_batch)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -106,7 +106,7 @@ def _train_one_model(
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                preds = _unpack_pred(model(X_batch)) # CRITICAL FIX: Unpack tuple
+                preds = _unpack_pred(model(X_batch))
                 val_loss += criterion(preds, y_batch).item() * len(X_batch)
         val_loss /= len(val_loader.dataset)
 
@@ -141,7 +141,7 @@ def _get_predictions(model: nn.Module, X: np.ndarray,
     model.to(device)
     X_t  = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
-        preds = _unpack_pred(model(X_t)) # CRITICAL FIX: Unpack tuple
+        preds = _unpack_pred(model(X_t))
         return preds.cpu().numpy()
 
 
@@ -196,7 +196,7 @@ def train_pipeline(
     # STAGE 2 — ResidualLSTM: capture long-term memory from RNN residuals
     # ══════════════════════════════════════════════════════════════════════════
     logger.info(f"\n  ── Stage 2: ResidualLSTM (long-term memory from residuals) ──")
-    rnn_residuals_train = y_train - rnn_train_preds   # ε_t,RNN (1D array)
+    rnn_residuals_train = y_train - rnn_train_preds
 
     # Build rolling windows of the 1D residuals
     res_seq_train = _create_residual_sequences(rnn_residuals_train, lookback)
@@ -243,18 +243,22 @@ def train_pipeline(
     # ══════════════════════════════════════════════════════════════════════════
     logger.info(f"\n  ── Stage 3: HybridLSTM (final integration) ──")
 
+    # CRITICAL FIX: Slice predictions to match the X_tr split BEFORE creating lagged sequences
+    rnn_tr_preds_slice = rnn_train_preds[:val_split]
+    lstm_tr_preds_slice = lstm_train_preds[:val_split]
+
     # Create lagged AR terms (1-step lag, NOT 0-step leak)
-    rnn_lagged_train = _create_lagged_sequences(rnn_train_preds, lookback)
-    lstm_lagged_train = _create_lagged_sequences(lstm_train_preds, lookback)
+    rnn_lagged_train = _create_lagged_sequences(rnn_tr_preds_slice, lookback)
+    lstm_lagged_train = _create_lagged_sequences(lstm_tr_preds_slice, lookback)
     
     rnn_lagged_test = _create_lagged_sequences(rnn_test_preds, lookback)
     lstm_lagged_test = _create_lagged_sequences(lstm_test_preds, lookback)
 
-    # Augment X with lagged predictions
-    X_train_aug = np.concatenate([X_tr, rnn_lagged_train[val_split:], lstm_lagged_train[val_split:]], axis=-1).astype(np.float32)
+    # Augment X with lagged predictions (dimensions now guaranteed to match)
+    X_train_aug = np.concatenate([X_tr, rnn_lagged_train, lstm_lagged_train], axis=-1).astype(np.float32)
     X_test_aug  = np.concatenate([X_test, rnn_lagged_test, lstm_lagged_test], axis=-1).astype(np.float32)
 
-    # Re-split augmented train into train/val
+    # Re-split augmented train into train/val (using the exact same val_split boundary)
     val_size_aug = len(X_train_aug) - val_split
     hyb_train_loader = _make_loader(X_train_aug[:val_size_aug],  y_tr,  BATCH_SIZE, shuffle=True)
     hyb_val_loader   = _make_loader(X_train_aug[val_size_aug:], y_val, BATCH_SIZE, shuffle=False)
@@ -296,7 +300,7 @@ def _compute_metrics(y_true, y_hybrid, y_rnn=None, y_combined=None) -> dict:
         a, b = a[:min_len], b[:min_len]
         if len(a) < 2:
             return 0.0
-        return float(np.mean(np.sign(a[1:]) == np.sign(b[1:])) * 100)
+        return float(np.mean(np.sign(a[1:]) == np.sign(b[1:])) * 100
 
     metrics = {
         "hybrid_mae":     mae(y_true, y_hybrid),
