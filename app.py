@@ -350,41 +350,41 @@ def render_dashboard_for_group(group_etfs, group_name):
         else:
             top = group_rankings.iloc[0]
             ret = top["predicted_return_pct"]
-            ret_color = "#16a34a" if ret >= 0 else "#dc2626"
-            bg_color  = "#f0fdf4" if ret >= 0 else "#fef2f2"
-            bdr_color = "#bbf7d0" if ret >= 0 else "#fecaca"
             
-            # Signal source displayed as plain text outside the HTML div
+            # Display signal source
             st.caption(f"Signal source: {signal_source}")
             
-            # Create the HTML content as a clean string
-            html_content = f"""
-            <div style="background:{bg_color}; border:2px solid {bdr_color}; border-radius:12px; padding:22px 28px; margin-bottom:16px;">
-                <div style="font-size:11px; letter-spacing:3px; color:#6b7280; margin-bottom:8px;">
-                    NEXT TRADING DAY SIGNAL — {group_name} · {signal_date_str}
-                    <span style="float:right; font-size:10px; color:#9ca3af;">
-                        MODEL: {top['model_used']}
-                    </span>
-                </div>
-                <div style="font-size:52px; font-weight:900; color:#111827; line-height:1;">
-                    {top['etf']}
-                </div>
-                <div style="font-size:13px; color:#6b7280; margin-top:4px;">
-                    {ETF_LABELS.get(top['etf'], '')}
-                </div>
-                <div style="margin-top:10px; font-size:14px; color:#374151;">
-                    Predicted Return:
-                    <strong style="color:{ret_color};">{'%+.3f' % ret}%</strong>
-                    &nbsp;·&nbsp; Dir Accuracy:
-                    <strong style="color:#d97706;">{top['direction_accuracy']:.1f}%</strong>
-                    &nbsp;·&nbsp; H =
-                    <strong style="color:#0284c7;">{top['hurst_H']:.3f}</strong>
-                </div>
-            </div>
-            """
+            # Use columns for better layout with native components
+            col1, col2 = st.columns([3, 1])
             
-            # Use st.markdown with unsafe_allow_html=True
-            st.markdown(html_content, unsafe_allow_html=True)
+            with col1:
+                # Display the main signal using native Streamlit components
+                st.markdown(f"### NEXT TRADING DAY SIGNAL — {group_name} · {signal_date_str}")
+                
+                # ETF symbol in large text
+                st.markdown(f"<p style='font-size:52px; font-weight:900; color:#111827; margin:0;'>{top['etf']}</p>", unsafe_allow_html=True)
+                st.markdown(f"<p style='font-size:14px; color:#6b7280; margin-top:0;'>{ETF_LABELS.get(top['etf'], '')}</p>", unsafe_allow_html=True)
+                
+                # Metrics in a row using native streamlit metrics
+                m1, m2, m3 = st.columns(3)
+                m1.metric(
+                    "Predicted Return", 
+                    f"{'+' if ret >= 0 else ''}{ret:.3f}%",
+                    delta_color="normal" if ret >= 0 else "inverse"
+                )
+                m2.metric("Directional Accuracy", f"{top['direction_accuracy']:.1f}%")
+                m3.metric("Hurst H", f"{top['hurst_H']:.3f}")
+            
+            with col2:
+                # Model badge using HTML
+                st.markdown(f"""
+                <div style="background:#f1f5f9; padding:12px 16px; border-radius:8px; text-align:center;">
+                    <div style="font-size:11px; color:#64748b;">MODEL</div>
+                    <div style="font-size:16px; font-weight:700; color:#0f172a;">{top['model_used']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.divider()
 
             st.subheader(f"📊 {group_name} ETF Predictions — Next Trading Day")
             pred_cols = st.columns(3)
@@ -393,18 +393,16 @@ def render_dashboard_for_group(group_etfs, group_name):
                 etf  = row["etf"]
                 r    = row["predicted_return_pct"]
                 ret_col = "#16a34a" if r > 0 else "#dc2626"
-                bg      = "#f0fdf4" if r > 0 else "#fef2f2"
-                bdr     = "#bbf7d0" if r > 0 else "#fecaca"
                 etf_col = ETF_COLORS.get(etf, "#374151")
                 with pred_cols[cidx]:
-                    card_html = f"""
-                    <div style="border:1px solid {bdr}; border-radius:10px; padding:16px; margin-bottom:12px; background:{bg};">
+                    st.markdown(f"""
+                    <div style="border:1px solid #e2e8f0; border-radius:10px; padding:16px; margin-bottom:12px; background:#f8fafc;">
                         <div style="font-size:10px; color:#9ca3af; margin-bottom:4px;">
                             #{int(row['rank'])} · {ETF_LABELS.get(etf, etf)}
                         </div>
                         <div style="font-size:26px; font-weight:900; color:{etf_col};">{etf}</div>
                         <div style="font-size:22px; font-weight:700; color:{ret_col}; margin:4px 0;">
-                            {'%+.3f' % r}%
+                            {'+' if r > 0 else ''}{r:.3f}%
                         </div>
                         <div style="font-size:11px; color:#6b7280;">
                             H={row['hurst_H']:.3f} · {row['model_used']}
@@ -414,8 +412,7 @@ def render_dashboard_for_group(group_etfs, group_name):
                             ${row['current_price']:.2f} → ${row['predicted_price']:.2f}
                         </div>
                     </div>
-                    """
-                    st.markdown(card_html, unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
 
     # ------------------ Tab 1: OOS Forecast Chart ------------------
     with subtabs[1]:
