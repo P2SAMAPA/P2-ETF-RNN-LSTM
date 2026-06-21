@@ -18,16 +18,10 @@ torch.manual_seed(SEED)
 
 class SimpleRNN(nn.Module):
     """
-    Vanilla RNN — used to capture SHORT-TERM memory information.
-
-    Per the paper: RNNs are deliberately limited to short-term memory
-    due to the vanishing gradient problem. This limitation is EXPLOITED
-    in the hybrid model to cleanly isolate short-term dynamics.
-
+    Vanilla RNN — captures SHORT-TERM memory information.
     Input:  (batch, lookback, n_features)
-    Output: (batch, 1)  — predicted next-day log-return
+    Output: (batch, hidden_size) — NOTE: Returns hidden state, not final FC prediction yet.
     """
-
     def __init__(self, input_size: int, hidden_size: int = RNN_HIDDEN,
                  num_layers: int = RNN_LAYERS, dropout: float = DROPOUT):
         super().__init__()
@@ -40,32 +34,51 @@ class SimpleRNN(nn.Module):
             nonlinearity="tanh",
         )
         self.dropout = nn.Dropout(dropout)
-        self.fc      = nn.Linear(hidden_size, 1)
+        self.fc = nn.Linear(hidden_size, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq_len, features)
-        out, _ = self.rnn(x)
-        out    = self.dropout(out[:, -1, :])   # take last timestep
-        return self.fc(out).squeeze(-1)
+    def forward(self, x: torch.Tensor, hidden: torch.Tensor = None) -> tuple:
+        out, h_n = self.rnn(x, hidden)
+        out = self.dropout(out[:, -1, :])
+        pred = self.fc(out).squeeze(-1)
+        return pred, h_n
 
 
 class ResidualLSTM(nn.Module):
     """
     LSTM trained on RNN residuals — captures LONG-TERM memory.
-
-    Per the paper (Eq. 28):
-        ε_t,RNN = g_long(p_{t-i}) + ε_t
-    The residuals from the RNN contain the long-term memory signal.
-    An LSTM is used to extract g_long from those residuals.
-
-    Input:  (batch, lookback, n_features)  — features of the residual series
-    Output: (batch, 1)  — predicted residual (= long-term component)
+    CRITICAL FIX: Input size is now 1 (the scalar residual), not n_features.
+    Input:  (batch, lookback, 1)
+    Output: (batch, 1)
     """
-
-    def __init__(self, input_size: int, hidden_size: int = LSTM_HIDDEN,
+    def __init__(self, input_size: int = 1, hidden_size: int = LSTM_HIDDEN,
                  num_layers: int = LSTM_LAYERS, dropout: float = DROPOUT):
         super().__init__()
-        self.lstm    = nn.LSTM(
+        self.lstm = nn.LSTM(
+            input_size=input_size,  # Fixed: Expects the 1D residual series
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x: torch.Tensor, hidden: torch.Tensor = None) -> tuple:
+        out, (h_n, c_n) = self.lstm(x, hidden)
+        out = self.dropout(out[:, -1, :])
+        pred = self.fc(out).squeeze(-1)
+        return pred, (h_n, c_n)
+
+
+class HybridLSTM(nn.Module):
+    """
+    Final ARMA-RNN-LSTM Hybrid Model.
+    CRITICAL FIX: input_size dynamically handles features + 2 AR components.
+    """
+    def __init__(self, input_size: int, hidden_size: int = LSTM2_HIDDEN,
+                 num_layers: int = LSTM_LAYERS, dropout: float = DROPOUT):
+        super().__init__()
+        self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
@@ -73,83 +86,46 @@ class ResidualLSTM(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.dropout = nn.Dropout(dropout)
-        self.fc      = nn.Linear(hidden_size, 1)
+        self.fc = nn.Linear(hidden_size, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)
-        out    = self.dropout(out[:, -1, :])
-        return self.fc(out).squeeze(-1)
-
-
-class HybridLSTM(nn.Module):
-    """
-    Final ARMA-RNN-LSTM Hybrid Model (Eq. 33 in paper).
-
-    Takes as input a concatenation of:
-      [original features, rnn_prediction, lstm_residual_prediction]
-    and produces the final refined forecast.
-
-    This mirrors the ARMA structure where:
-      - RNN  ≡ AR component (historical prices → short-term forecast)
-      - LSTM ≡ MA component (error/residual terms → long-term forecast)
-      - HybridLSTM ≡ integrator that fuses both
-
-    Input:  (batch, lookback, n_features + 2)
-    Output: (batch, 1)
-    """
-
-    def __init__(self, input_size: int, hidden_size: int = LSTM2_HIDDEN,
-                 num_layers: int = LSTM_LAYERS, dropout: float = DROPOUT):
-        super().__init__()
-        self.lstm    = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-        self.dropout  = nn.Dropout(dropout)
-        self.fc       = nn.Linear(hidden_size, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)
-        out    = self.dropout(out[:, -1, :])
-        return self.fc(out).squeeze(-1)
+    def forward(self, x: torch.Tensor, hidden: torch.Tensor = None) -> tuple:
+        out, (h_n, c_n) = self.lstm(x, hidden)
+        out = self.dropout(out[:, -1, :])
+        pred = self.fc(out).squeeze(-1)
+        return pred, (h_n, c_n)
 
 
 class ARMARNNLSTMPipeline(nn.Module):
     """
-    Full ARMA-RNN-LSTM pipeline as a single nn.Module.
-
-    Implements the 3-stage process from Xiao (2025):
-      Stage 1: SimpleRNN    → short-term forecast  (p̂_RNN)
-      Stage 2: ResidualLSTM → long-term residual   (ε̂_LSTM)
-      Stage 3: HybridLSTM   → final forecast       (p̂_hybrid)
-
-    Note: In training, stages are trained sequentially (not end-to-end).
-    This module is used for inference only.
+    Full ARMA-RNN-LSTM pipeline.
+    CRITICAL FIX: Removed the look-ahead broadcasting bug. 
+    The model now outputs raw hidden states so the trainer can correctly 
+    construct the autoregressive sequence without temporal leakage.
     """
-
     def __init__(self, input_size: int):
         super().__init__()
-        self.rnn          = SimpleRNN(input_size)
-        self.residual_lstm = ResidualLSTM(input_size)
-        self.hybrid_lstm  = HybridLSTM(input_size + 2)   # +2 for rnn+lstm preds
+        self.input_size = input_size
+        self.rnn = SimpleRNN(input_size)
+        self.residual_lstm = ResidualLSTM(input_size=1) # Fixed: Residuals are 1D
+        self.hybrid_lstm = HybridLSTM(input_size=input_size + 2) # Features + AR + MA components
 
-    def forward(self, x: torch.Tensor,
-                rnn_pred: torch.Tensor,
-                lstm_pred: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, 
+                rnn_h: torch.Tensor = None,
+                lstm_h: torch.Tensor = None,
+                hybrid_h: torch.Tensor = None) -> dict:
         """
-        x         : (batch, lookback, n_features)
-        rnn_pred  : (batch, 1) — appended at each timestep
-        lstm_pred : (batch, 1) — appended at each timestep
+        x: (batch, lookback, n_features)
+        Returns a dictionary of predictions and hidden states so the trainer 
+        can safely construct the next step without data leakage.
         """
-        # Expand scalar preds to (batch, lookback, 1) and concatenate
-        rnn_exp  = rnn_pred.unsqueeze(1).unsqueeze(2).expand(-1, x.size(1), 1)
-        lstm_exp = lstm_pred.unsqueeze(1).unsqueeze(2).expand(-1, x.size(1), 1)
-        x_aug    = torch.cat([x, rnn_exp, lstm_exp], dim=-1)
-        return self.hybrid_lstm(x_aug)
-
-
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+        # Stage 1: Short-term prediction
+        rnn_pred, new_rnn_h = self.rnn(x, rnn_h)
+        
+        # Stage 3 Preparation: We return the raw RNN prediction here.
+        # The TRAINER is responsible for creating the residual series and 
+        # appending the AR terms to the sequence to avoid look-ahead bias.
+        
+        return {
+            "rnn_pred": rnn_pred,
+            "rnn_h": new_rnn_h
+        }
