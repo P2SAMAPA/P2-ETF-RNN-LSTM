@@ -174,27 +174,29 @@ def train_test_split_sequences(X, y, dates, split: float = 0.625):
 
 
 class Normaliser:
-    """Min-max normaliser fitted on training set only (no data leakage)."""
+    """
+    Standard Scaler (Z-Score normalisation) fitted on training set only.
+    CRITICAL FIX: Replaced Min-Max scaling. Min-Max on financial returns causes 
+    feature collapse over time as historical outliers age out of the window, 
+    destroying LSTM gradient flow.
+    """
 
     def __init__(self):
-        self.min_ = None
-        self.max_ = None
-        self.range_ = None
+        self.mean_ = None
+        self.std_ = None
 
     def fit(self, X: np.ndarray):
         # X shape: (n_samples, lookback, n_features) or (n_samples, n_features)
         flat = X.reshape(-1, X.shape[-1])
-        self.min_   = flat.min(axis=0)
-        self.max_   = flat.max(axis=0)
-        self.range_ = np.where(self.max_ - self.min_ == 0, 1.0,
-                               self.max_ - self.min_)
+        self.mean_ = flat.mean(axis=0)
+        self.std_  = np.where(flat.std(axis=0) < 1e-8, 1.0, flat.std(axis=0))
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
-        return (X - self.min_) / self.range_
+        return (X - self.mean_) / self.std_
 
     def fit_transform(self, X: np.ndarray) -> np.ndarray:
         return self.fit(X).transform(X)
 
     def inverse_transform_scalar(self, val: float, feature_idx: int = 0) -> float:
-        return val * self.range_[feature_idx] + self.min_[feature_idx]
+        return val * self.std_[feature_idx] + self.mean_[feature_idx]
