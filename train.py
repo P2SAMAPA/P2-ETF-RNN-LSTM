@@ -123,9 +123,6 @@ def main():
         X_train_n = norm.fit_transform(X_train)
         X_test_n  = norm.transform(X_test)
 
-        # Optionally warm-start from saved weights
-        # (weights loading handled inside train_pipeline if retrain_scratch=False)
-
         # Run 3-stage pipeline
         result = train_pipeline(
             X_train=X_train_n,
@@ -155,22 +152,64 @@ def main():
             hlstm = result["hybrid_lstm"]
             rnn.eval(); rlstm.eval(); hlstm.eval()
 
+            # Step 1: Get RNN predictions for the last LOOKBACK days
+            # We need to compute residuals for the last LOOKBACK days to feed into ResidualLSTM
+            rnn_preds_last = []
+            for i in range(LOOKBACK):
+                # Get the sequence ending at position -(LOOKBACK - i)
+                seq_start = -(LOOKBACK + 1) + i
+                seq_end = seq_start + LOOKBACK
+                if seq_start < 0:
+                    seq_start = 0
+                if seq_end > len(features):
+                    seq_end = len(features)
+                if seq_end - seq_start < LOOKBACK:
+                    continue
+                seq_features = features.iloc[seq_start:seq_end]
+                X_seq = norm.transform(
+                    seq_features[[c for c in seq_features.columns if c != "target"]].values[np.newaxis, ...]
+                )
+                X_seq_t = th.tensor(X_seq, dtype=th.float32).to(device)
+                with th.no_grad():
+                    pred = _unpack_pred(rnn(X_seq_t)).cpu().numpy()[0]
+                rnn_preds_last.append(pred)
+            
+            # Get the corresponding actual returns
+            actual_returns_last = features['target'].iloc[-len(rnn_preds_last):].values
+            
+            # Compute residuals
+            residuals = actual_returns_last - np.array(rnn_preds_last)
+            
+            # Ensure we have exactly LOOKBACK residuals
+            if len(residuals) < LOOKBACK:
+                # Pad with zeros if needed
+                residuals = np.pad(residuals, (LOOKBACK - len(residuals), 0), mode='constant')
+            elif len(residuals) > LOOKBACK:
+                residuals = residuals[-LOOKBACK:]
+            
+            # Build residual sequence (shape: 1, LOOKBACK, 1)
+            res_seq = residuals.reshape(1, LOOKBACK, 1).astype(np.float32)
+            
+            # Step 2: Get LSTM prediction from residuals
+            res_t = th.tensor(res_seq, dtype=th.float32).to(device)
+            with th.no_grad():
+                lstm_pred = _unpack_pred(rlstm(res_t))
+                lstm_p = lstm_pred.cpu().numpy()[0]
+            
+            # Step 3: Get RNN prediction for the current X_last
             X_t = th.tensor(X_last, dtype=th.float32).to(device)
             with th.no_grad():
-                # FIX: Unpack tuple from RNN output
-                rnn_pred = _unpack_pred(rnn(X_t))
-                rnn_p = rnn_pred.cpu().numpy()
-                
-                # FIX: Unpack tuple from ResidualLSTM output
-                res_pred = _unpack_pred(rlstm(X_t))
-                res_p = res_pred.cpu().numpy()
-                
-                rnn_col  = np.full((1, X_last.shape[1], 1), rnn_p[0])
-                lstm_col = np.full((1, X_last.shape[1], 1), res_p[0])
-                X_aug    = np.concatenate([X_last, rnn_col, lstm_col], axis=-1)
-                X_aug_t  = th.tensor(X_aug, dtype=th.float32).to(device)
-                
-                # FIX: Unpack tuple from HybridLSTM output
+                rnn_pred_current = _unpack_pred(rnn(X_t))
+                rnn_p = rnn_pred_current.cpu().numpy()[0]
+            
+            # Step 4: Build augmented input for hybrid model
+            # Create lagged prediction columns (using the latest predictions)
+            rnn_lagged = np.full((1, LOOKBACK, 1), rnn_p)
+            lstm_lagged = np.full((1, LOOKBACK, 1), lstm_p)
+            X_aug = np.concatenate([X_last, rnn_lagged, lstm_lagged], axis=-1)
+            X_aug_t = th.tensor(X_aug, dtype=th.float32).to(device)
+            
+            with th.no_grad():
                 hybrid_pred = _unpack_pred(hlstm(X_aug_t))
                 pred_logret = hybrid_pred.cpu().numpy()[0]
         else:
@@ -179,7 +218,6 @@ def main():
             rnn.eval()
             X_t = th.tensor(X_last, dtype=th.float32).to(device)
             with th.no_grad():
-                # FIX: Unpack tuple from RNN output
                 rnn_pred = _unpack_pred(rnn(X_t))
                 pred_logret = rnn_pred.cpu().numpy()[0]
 
