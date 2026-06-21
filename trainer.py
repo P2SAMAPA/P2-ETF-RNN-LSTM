@@ -259,9 +259,8 @@ def train_pipeline(
     X_test_aug  = np.concatenate([X_test, rnn_lagged_test, lstm_lagged_test], axis=-1).astype(np.float32)
 
     # Re-split augmented train into train/val (using the exact same val_split boundary)
-    val_size_aug = len(X_train_aug) - val_split
-    hyb_train_loader = _make_loader(X_train_aug[:val_size_aug],  y_tr,  BATCH_SIZE, shuffle=True)
-    hyb_val_loader   = _make_loader(X_train_aug[val_size_aug:], y_val, BATCH_SIZE, shuffle=False)
+    hyb_train_loader = _make_loader(X_train_aug[:val_split],  y_tr,  BATCH_SIZE, shuffle=True)
+    hyb_val_loader   = _make_loader(X_train_aug[val_split:], y_val, BATCH_SIZE, shuffle=False)
 
     hybrid_lstm = HybridLSTM(input_size=n_features + 2)
     hist3       = _train_one_model(hybrid_lstm, hyb_train_loader, hyb_val_loader,
