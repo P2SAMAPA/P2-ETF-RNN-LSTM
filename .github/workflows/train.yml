@@ -9,7 +9,7 @@ on:
       retrain_from_scratch:
         description: 'Force retrain from scratch (ignore saved weights)'
         required: false
-        default: 'false'
+        default: 'true'
       lookback_years:
         description: 'Years of data to use for training (default: all)'
         required: false
