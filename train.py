@@ -152,58 +152,64 @@ def main():
             hlstm = result["hybrid_lstm"]
             rnn.eval(); rlstm.eval(); hlstm.eval()
 
-            # Step 1: Get RNN predictions for the last LOOKBACK days
-            # We need to compute residuals for the last LOOKBACK days to feed into ResidualLSTM
-            rnn_preds_last = []
-            for i in range(LOOKBACK):
-                # Get the sequence ending at position -(LOOKBACK - i)
-                seq_start = -(LOOKBACK + 1) + i
-                seq_end = seq_start + LOOKBACK
+            # Get the last LOOKBACK sequences from the features
+            # We need to compute residuals for each of these points
+            feature_cols = [c for c in features.columns if c != "target"]
+            residual_sequence = []
+            
+            # Start from the point LOOKBACK days before the end, going up to the last point
+            for i in range(LOOKBACK, 0, -1):
+                seq_end = len(features) - i + 1
+                seq_start = seq_end - LOOKBACK
                 if seq_start < 0:
-                    seq_start = 0
-                if seq_end > len(features):
-                    seq_end = len(features)
-                if seq_end - seq_start < LOOKBACK:
-                    continue
+                    break
+                
+                # Get the sequence
                 seq_features = features.iloc[seq_start:seq_end]
-                X_seq = norm.transform(
-                    seq_features[[c for c in seq_features.columns if c != "target"]].values[np.newaxis, ...]
-                )
+                X_seq = norm.transform(seq_features[feature_cols].values[np.newaxis, ...])
+                
+                # Get RNN prediction for this sequence
                 X_seq_t = th.tensor(X_seq, dtype=th.float32).to(device)
                 with th.no_grad():
                     pred = _unpack_pred(rnn(X_seq_t)).cpu().numpy()[0]
-                rnn_preds_last.append(pred)
-            
-            # Get the corresponding actual returns
-            actual_returns_last = features['target'].iloc[-len(rnn_preds_last):].values
-            
-            # Compute residuals
-            residuals = actual_returns_last - np.array(rnn_preds_last)
+                
+                # Get the actual return for the next day (the target)
+                if seq_end < len(features):
+                    actual = features['target'].iloc[seq_end]
+                    residual = actual - pred
+                    residual_sequence.append(residual)
+                else:
+                    # For the last point, we don't have the actual return yet
+                    # Use the most recent known residual as an estimate
+                    if len(residual_sequence) > 0:
+                        residual_sequence.append(residual_sequence[-1])
+                    else:
+                        residual_sequence.append(0.0)
             
             # Ensure we have exactly LOOKBACK residuals
-            if len(residuals) < LOOKBACK:
+            if len(residual_sequence) < LOOKBACK:
                 # Pad with zeros if needed
-                residuals = np.pad(residuals, (LOOKBACK - len(residuals), 0), mode='constant')
-            elif len(residuals) > LOOKBACK:
-                residuals = residuals[-LOOKBACK:]
+                residual_sequence = [0.0] * (LOOKBACK - len(residual_sequence)) + residual_sequence
+            elif len(residual_sequence) > LOOKBACK:
+                residual_sequence = residual_sequence[-LOOKBACK:]
             
             # Build residual sequence (shape: 1, LOOKBACK, 1)
-            res_seq = residuals.reshape(1, LOOKBACK, 1).astype(np.float32)
+            residuals = np.array(residual_sequence[-LOOKBACK:], dtype=np.float32)
+            res_seq = residuals.reshape(1, LOOKBACK, 1)
             
-            # Step 2: Get LSTM prediction from residuals
+            # Get LSTM prediction from residuals
             res_t = th.tensor(res_seq, dtype=th.float32).to(device)
             with th.no_grad():
                 lstm_pred = _unpack_pred(rlstm(res_t))
                 lstm_p = lstm_pred.cpu().numpy()[0]
             
-            # Step 3: Get RNN prediction for the current X_last
+            # Get RNN prediction for the current X_last
             X_t = th.tensor(X_last, dtype=th.float32).to(device)
             with th.no_grad():
-                rnn_pred_current = _unpack_pred(rnn(X_t))
-                rnn_p = rnn_pred_current.cpu().numpy()[0]
+                rnn_pred = _unpack_pred(rnn(X_t))
+                rnn_p = rnn_pred.cpu().numpy()[0]
             
-            # Step 4: Build augmented input for hybrid model
-            # Create lagged prediction columns (using the latest predictions)
+            # Build augmented input for hybrid model
             rnn_lagged = np.full((1, LOOKBACK, 1), rnn_p)
             lstm_lagged = np.full((1, LOOKBACK, 1), lstm_p)
             X_aug = np.concatenate([X_last, rnn_lagged, lstm_lagged], axis=-1)
