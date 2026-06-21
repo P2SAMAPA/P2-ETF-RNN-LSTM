@@ -254,13 +254,44 @@ def train_pipeline(
     rnn_lagged_test = _create_lagged_sequences(rnn_test_preds, lookback)
     lstm_lagged_test = _create_lagged_sequences(lstm_test_preds, lookback)
 
-    # Augment X with lagged predictions (dimensions now guaranteed to match)
+    # Augment X with lagged predictions
     X_train_aug = np.concatenate([X_tr, rnn_lagged_train, lstm_lagged_train], axis=-1).astype(np.float32)
     X_test_aug  = np.concatenate([X_test, rnn_lagged_test, lstm_lagged_test], axis=-1).astype(np.float32)
 
-    # Re-split augmented train into train/val (using the exact same val_split boundary)
-    hyb_train_loader = _make_loader(X_train_aug[:val_split],  y_tr,  BATCH_SIZE, shuffle=True)
-    hyb_val_loader   = _make_loader(X_train_aug[val_split:], y_val, BATCH_SIZE, shuffle=False)
+    # CRITICAL: The lagged sequences lose 'lookback' samples at the beginning.
+    # We need to trim the targets to match the augmented data length.
+    # The first 'lookback' samples in X_train_aug are zeros (from the initialization in _create_lagged_sequences)
+    # so we should start from index 'lookback'.
+    
+    # Determine the effective length of the augmented data (excluding the zero-padded initial samples)
+    effective_start = lookback  # Skip the zero-padded samples at the beginning
+    
+    # Trim X_train_aug to only include valid samples (where lagged data is meaningful)
+    X_train_aug_valid = X_train_aug[effective_start:]
+    
+    # Trim y_tr and y_val to match the valid X samples
+    # y_tr corresponds to the first val_split samples of the original data
+    # We need to skip the same number of initial samples
+    y_tr_trimmed = y_tr[effective_start:]
+    y_val_trimmed = y_val[effective_start:]
+    
+    # Now re-split the trimmed augmented data into train/val
+    # The validation split should be based on the trimmed data length
+    val_split_aug = int(len(X_train_aug_valid) * 0.8)
+    
+    X_train_aug_final = X_train_aug_valid[:val_split_aug]
+    X_val_aug_final = X_train_aug_valid[val_split_aug:]
+    
+    # Trim y data accordingly
+    y_train_aug = y_tr_trimmed[:val_split_aug]
+    y_val_aug = y_tr_trimmed[val_split_aug:]  # Note: y_val_trimmed is not used here because we need contiguous data
+    
+    # Verify lengths match
+    logger.info(f"  X_train_aug_final shape: {X_train_aug_final.shape}, y_train_aug shape: {y_train_aug.shape}")
+    logger.info(f"  X_val_aug_final shape: {X_val_aug_final.shape}, y_val_aug shape: {y_val_aug.shape}")
+    
+    hyb_train_loader = _make_loader(X_train_aug_final, y_train_aug, BATCH_SIZE, shuffle=True)
+    hyb_val_loader   = _make_loader(X_val_aug_final, y_val_aug, BATCH_SIZE, shuffle=False)
 
     hybrid_lstm = HybridLSTM(input_size=n_features + 2)
     hist3       = _train_one_model(hybrid_lstm, hyb_train_loader, hyb_val_loader,
@@ -268,6 +299,7 @@ def train_pipeline(
     result["hybrid_lstm"]                       = hybrid_lstm
     result["stage_histories"]["hybrid_lstm"]    = hist3
 
+    # Get predictions using the full augmented data (including zero-padded initial samples)
     hybrid_train_preds = _get_predictions(hybrid_lstm, X_train_aug, device)
     hybrid_test_preds  = _get_predictions(hybrid_lstm, X_test_aug,  device)
 
